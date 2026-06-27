@@ -1,4 +1,5 @@
 use std::cmp::Reverse;
+use std::convert::identity;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
@@ -22,6 +23,15 @@ use ratatui::{
 
 use tracing::instrument;
 use tui_tree_widget::{Scrollbar, Tree, TreeItem, TreeState};
+
+use clap::Parser;
+
+#[derive(Parser)]
+#[command(version, about, long_about = None)]
+struct Args {
+    #[arg(default_value = ".")]
+    path: PathBuf,
+}
 
 type DirTree = OrdMap<usize, Entry>;
 
@@ -61,22 +71,25 @@ fn scan_fs<P: AsRef<Path>>(path: P) -> Result<DirTree> {
                 let range = key_range(&subtree).unwrap_or_default();
                 let size = range.len();
 
-                Ok(Entry {
+                Ok(Some(Entry {
                     path: ent.path(),
                     size,
                     subtree,
-                })
+                }))
             } else if metadata.is_file() {
-                Ok(Entry {
+                Ok(Some(Entry {
                     path: ent.path(),
                     size: metadata.len() as usize,
                     subtree: Default::default(),
-                })
+                }))
             } else {
-                todo!("Symlinks?")
+                // TODO: deal with hard links possibly at different levels
+                // Ignore symlinks
+                Ok(None)
             }
         })
         .flatten()
+        .filter_map_ok(identity)
         .collect::<Result<Vec<_>>>()?;
 
     entries.sort_by_key(|it| Reverse(it.size));
@@ -102,18 +115,20 @@ fn main() -> Result<()> {
 
     color_eyre::install()?;
 
-    let target = "target";
-    let scanned = scan_fs(target)?;
+    let args = Args::parse();
 
-    ratatui::run(|terminal| App::new(target, scanned).run(terminal))
+    let target = args.path;
+    let scanned = scan_fs(&target)?;
+
+    ratatui::run(|terminal| App::new(&target, scanned).run(terminal))
 }
 
-fn partition(whole: DirTree) -> MaybePair<DirTree> {
+fn partition(whole: &DirTree) -> MaybePair<DirTree> {
     if whole.len() <= 1 {
         return MaybePair::One(whole.clone());
     }
 
-    let range = key_range(&whole).unwrap();
+    let range = key_range(whole).unwrap();
 
     let start = range.start;
     let end = range.end;
@@ -294,11 +309,11 @@ fn tree_items(entries: OrdMap<usize, Entry>) -> Vec<TreeItem<'static, usize>> {
 
 impl Widget for &App {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        render_subtree(area, buf, self.entries.clone(), &self.selection);
+        render_subtree(area, buf, &self.entries, &self.selection);
     }
 }
 
-fn render_subtree(area: Rect, buf: &mut Buffer, tree: DirTree, selection: &[usize]) {
+fn render_subtree(area: Rect, buf: &mut Buffer, tree: &DirTree, selection: &[usize]) {
     if tree.is_empty() {
         return;
     }
@@ -320,7 +335,7 @@ fn render_subtree(area: Rect, buf: &mut Buffer, tree: DirTree, selection: &[usiz
         return;
     }
 
-    let Some(total) = key_range(&tree).map(|r| r.len() as u32) else {
+    let Some(total) = key_range(tree).map(|r| r.len() as u32) else {
         return;
     };
 
@@ -334,7 +349,7 @@ fn render_subtree(area: Rect, buf: &mut Buffer, tree: DirTree, selection: &[usiz
 
     match partition(tree) {
         MaybePair::One(entries) => {
-            render_subtree(area, buf, entries, selection);
+            render_subtree(area, buf, &entries, selection);
             // Paragraph::new(format!("{entries:?}"))
             //     .centered()
             //     .render(area, buf);
@@ -357,8 +372,8 @@ fn render_subtree(area: Rect, buf: &mut Buffer, tree: DirTree, selection: &[usiz
                 ])
                 .split(area);
 
-            render_subtree(layout[0], buf, left, selection);
-            render_subtree(layout[1], buf, right, selection);
+            render_subtree(layout[0], buf, &left, selection);
+            render_subtree(layout[1], buf, &right, selection);
         }
     }
 }
@@ -401,6 +416,6 @@ fn render_entry(area: Rect, buf: &mut Buffer, key: usize, entry: &Entry, selecti
             .style(style)
             .render(inner, buf);
     } else if inner.height > 2 || inner.width > 2 {
-        render_subtree(inner, buf, subtree.clone(), selection);
+        render_subtree(inner, buf, subtree, selection);
     }
 }

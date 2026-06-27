@@ -14,5 +14,8 @@ pkgs.mkShell {
     pkg-config
     rust-toolchain
     stgit
+    perf
+    cargo-flamegraph
+    rust-addr2line
   ] ++ libraries;
 }
