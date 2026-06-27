@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use color_eyre::Result;
 use crossterm::ExecutableCommand as _;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, MouseEventKind};
+use eyre::Context as _;
 use humansize::{DECIMAL, format_size};
-use im::OrdMap;
 use itertools::Itertools as _;
 use ratatui::layout::{Constraint, Direction, Layout, Position};
 use ratatui::style::{Color, Modifier, Style};
@@ -33,7 +33,8 @@ struct Args {
     path: PathBuf,
 }
 
-type DirTree = OrdMap<usize, Entry>;
+type DirTree = Vec<(usize, Entry)>;
+type TreeSlice<'a> = &'a [(usize, Entry)];
 
 #[derive(Default, Clone, Debug)]
 pub struct Entry {
@@ -68,15 +69,19 @@ fn scan_fs<P: AsRef<Path>>(path: P) -> Result<DirTree> {
             let metadata = ent.metadata()?;
             if metadata.is_dir() {
                 let subtree = scan_fs(ent.path())?;
-                let range = key_range(&subtree).unwrap_or_default();
+                let range = key_range(subtree.as_slice()).unwrap_or_default();
                 let size = range.len();
 
-                Ok(Some(Entry {
-                    path: ent.path(),
-                    size,
-                    subtree,
-                }))
-            } else if metadata.is_file() {
+                if size > 0 {
+                    Ok(Some(Entry {
+                        path: ent.path(),
+                        size,
+                        subtree,
+                    }))
+                } else {
+                    Ok(None)
+                }
+            } else if metadata.is_file() && metadata.len() > 0 {
                 Ok(Some(Entry {
                     path: ent.path(),
                     size: metadata.len() as usize,
@@ -123,45 +128,41 @@ fn main() -> Result<()> {
     ratatui::run(|terminal| App::new(&target, scanned).run(terminal))
 }
 
-fn partition(whole: &DirTree) -> MaybePair<DirTree> {
+fn partition(whole: TreeSlice) -> MaybePair<TreeSlice> {
     if whole.len() <= 1 {
-        return MaybePair::One(whole.clone());
+        return MaybePair::One(whole);
     }
 
     let range = key_range(whole).unwrap();
 
     let start = range.start;
     let end = range.end;
-    range.len();
 
-    let half = (end - start) / 2 + start;
+    let half = (start + end) / 2;
 
-    let (left, right) = whole.split(&half);
-    if (left.is_empty() || right.is_empty()) && whole.len() > 1 {
-        // tracing::warn!("Empty partition for {range:?} at {half}");
-        let min = whole.get_min().cloned().unwrap();
-        let min = im::ordmap! {
-            min.0 => min.1
-        };
-
-        let (_, right) = whole.without_min();
-        MaybePair::Two(min, right)
-    } else {
+    let idx = whole.partition_point(|it| it.0 < half);
+    if idx > 0 && idx < whole.len() - 1 {
+        let left = &whole[..idx];
+        let right = &whole[idx..];
         MaybePair::Two(left, right)
+    } else if whole.len() > 1 {
+        MaybePair::Two(&whole[..1], &whole[1..])
+    } else {
+        MaybePair::One(whole)
     }
 }
 
-fn key_range(whole: &DirTree) -> Option<Range<usize>> {
+fn key_range(whole: TreeSlice) -> Option<Range<usize>> {
     if whole.is_empty() {
         return None;
     }
 
-    let (start, _) = whole.get_min().unwrap();
+    let (start, _) = whole[0];
 
-    let end = whole.get_max().unwrap();
+    let end = whole.last().unwrap();
     let end = end.0 + end.1.size;
 
-    Some((*start)..end)
+    Some((start)..end)
 }
 
 #[derive(Debug, Default)]
@@ -177,7 +178,7 @@ pub struct App {
 
 impl App {
     pub fn new(path: impl Into<PathBuf>, entries: DirTree) -> Self {
-        let tree_items = tree_items(entries.clone());
+        let tree_items = tree_items(entries.as_slice());
         Self {
             path: path.into(),
             entries,
@@ -291,17 +292,24 @@ impl App {
     }
 }
 
-fn tree_items(entries: OrdMap<usize, Entry>) -> Vec<TreeItem<'static, usize>> {
+fn tree_items(entries: TreeSlice) -> Vec<TreeItem<'static, usize>> {
     entries
-        .into_iter()
+        .iter()
         .map(|(k, v)| {
             let title = v.path.file_name().unwrap_or_default();
             let text = format!("[{}] {}", format_size(v.size, DECIMAL), title.display());
             if v.subtree.is_empty() {
-                TreeItem::new_leaf(k, text)
+                TreeItem::new_leaf(*k, text)
             } else {
-                let subtree = tree_items(v.subtree.clone());
-                TreeItem::new(k, text, subtree).unwrap()
+                let subtree = tree_items(v.subtree.as_slice());
+                let ids = subtree
+                    .iter()
+                    .map(|it| it.identifier())
+                    .cloned()
+                    .collect_vec();
+                TreeItem::new(*k, text, subtree)
+                    .context(format!("{ids:?}"))
+                    .unwrap()
             }
         })
         .collect_vec()
@@ -313,7 +321,7 @@ impl Widget for &App {
     }
 }
 
-fn render_subtree(area: Rect, buf: &mut Buffer, tree: &DirTree, selection: &[usize]) {
+fn render_subtree(area: Rect, buf: &mut Buffer, tree: TreeSlice, selection: &[usize]) {
     if tree.is_empty() {
         return;
     }
@@ -322,7 +330,7 @@ fn render_subtree(area: Rect, buf: &mut Buffer, tree: &DirTree, selection: &[usi
     // Can't display useful information if area is too small
     if area.height < 2 || area.width <= 2 {
         let head = selection.first();
-        if tree.keys().any(|k| Some(k) == head) {
+        if tree.iter().any(|(k, _)| Some(k) == head) {
             Fill::new("▓").style(Style::new().blue()).render(area, buf);
         } else if tree.len() == 1 {
             Block::bordered()
@@ -340,7 +348,7 @@ fn render_subtree(area: Rect, buf: &mut Buffer, tree: &DirTree, selection: &[usi
     };
 
     if tree.len() == 1 {
-        let (key, entry) = tree.get_min().unwrap();
+        let (key, entry) = &tree[0];
 
         render_entry(area, buf, *key, entry, selection);
 
@@ -349,14 +357,14 @@ fn render_subtree(area: Rect, buf: &mut Buffer, tree: &DirTree, selection: &[usi
 
     match partition(tree) {
         MaybePair::One(entries) => {
-            render_subtree(area, buf, &entries, selection);
+            render_subtree(area, buf, entries, selection);
             // Paragraph::new(format!("{entries:?}"))
             //     .centered()
             //     .render(area, buf);
         }
         MaybePair::Two(left, right) => {
-            let l = key_range(&left).map(|r| r.len() as u32).unwrap();
-            let r = key_range(&right).map(|r| r.len() as u32).unwrap();
+            let l = key_range(left).map(|r| (r.end - r.start) as u32).unwrap();
+            let r = key_range(right).map(|r| (r.end - r.start) as u32).unwrap();
 
             let direction = if area.width > area.height * 2 {
                 Direction::Horizontal
@@ -364,16 +372,24 @@ fn render_subtree(area: Rect, buf: &mut Buffer, tree: &DirTree, selection: &[usi
                 Direction::Vertical
             };
 
-            let layout = Layout::default()
+            let mut layout = Layout::default()
                 .direction(direction)
                 .constraints(vec![
-                    Constraint::Ratio(l, total),
-                    Constraint::Ratio(r, total),
+                    Constraint::Ratio(l, l + r),
+                    Constraint::Ratio(r, l + r),
                 ])
                 .split(area);
 
-            render_subtree(layout[0], buf, &left, selection);
-            render_subtree(layout[1], buf, &right, selection);
+            // // Ensure tiny left-overs are always represented even if it skews proportions
+            // if layout[1].width == 0 || layout[1].height == 0 {
+            //     layout = Layout::default()
+            //         .direction(direction)
+            //         .constraints(vec![Constraint::Percentage(100), Constraint::Min(1)])
+            //         .split(area);
+            // }
+
+            render_subtree(layout[0], buf, left, selection);
+            render_subtree(layout[1], buf, right, selection);
         }
     }
 }
