@@ -1,5 +1,7 @@
 use std::cmp::Reverse;
+use std::collections::HashMap;
 use std::convert::identity;
+use std::ffi::OsString;
 use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -32,6 +34,10 @@ use clap::Parser;
 struct Args {
     #[arg(default_value = ".")]
     path: PathBuf,
+
+    /// Group files in a directory by extension
+    #[arg(short, long)]
+    group: bool,
 }
 
 type DirTree = Vec<(usize, Entry)>;
@@ -43,6 +49,7 @@ pub struct Entry {
     size: usize,
     subtree: DirTree,
     color: Color,
+    is_group: bool,
 }
 
 #[ouroboros::self_referencing]
@@ -79,18 +86,17 @@ impl<P: AsRef<Path>> From<(P, usize)> for Entry {
             size,
             subtree: Default::default(),
             color: Color::Reset,
+            is_group: false,
         }
     }
 }
 
-// TODO: group small sibling files by type
-
-fn scan_fs<P: AsRef<Path>>(path: P) -> Result<DirTree> {
+fn scan_fs<P: AsRef<Path>>(path: P, make_groups: bool) -> Result<DirTree> {
     let mut entries = std::fs::read_dir(path)?
         .map_ok(|ent| -> Result<_> {
             let metadata = ent.metadata()?;
             if metadata.is_dir() {
-                let subtree = scan_fs(ent.path())?;
+                let subtree = scan_fs(ent.path(), make_groups)?;
                 let range = key_range(subtree.as_slice()).unwrap_or_default();
                 let size = range.len();
 
@@ -107,6 +113,7 @@ fn scan_fs<P: AsRef<Path>>(path: P) -> Result<DirTree> {
                         size,
                         subtree,
                         color: Color::Rgb(color.r, color.g, color.b),
+                        is_group: false,
                     }))
                 } else {
                     Ok(None)
@@ -130,6 +137,7 @@ fn scan_fs<P: AsRef<Path>>(path: P) -> Result<DirTree> {
                     size: metadata.len() as usize,
                     subtree: Default::default(),
                     color,
+                    is_group: false,
                 }))
             } else {
                 // TODO: deal with hard links possibly at different levels
@@ -143,6 +151,10 @@ fn scan_fs<P: AsRef<Path>>(path: P) -> Result<DirTree> {
 
     entries.sort_by_key(|it| Reverse(it.size));
 
+    if make_groups {
+        entries = regroup(entries);
+    }
+
     Ok(entries
         .into_iter()
         .scan(0, |acc, it| {
@@ -151,6 +163,57 @@ fn scan_fs<P: AsRef<Path>>(path: P) -> Result<DirTree> {
             Some((start, it))
         })
         .collect())
+}
+
+fn regroup(entries: Vec<Entry>) -> Vec<Entry> {
+    let mut groups: HashMap<OsString, Vec<Entry>> = Default::default();
+    entries
+        .into_iter()
+        .map(|it| {
+            let ext = it
+                .path
+                .extension()
+                .or_else(|| it.path.file_name())
+                .unwrap_or_default()
+                .to_owned();
+
+            (ext, it)
+        })
+        .for_each(|(k, v)| {
+            groups.entry(k).or_default().push(v);
+        });
+
+    let mut entries: Vec<_> = groups
+        .into_iter()
+        .map(|(k, mut v)| {
+            if v.len() == 1 {
+                v.pop().unwrap()
+            } else {
+                let label = format!("*.{}", k.display());
+                let size = v.iter().map(|it| it.size).sum();
+                let color = v[0].color;
+                let subtree = v
+                    .into_iter()
+                    .scan(0, |acc, it| {
+                        let start = *acc;
+                        *acc += it.size;
+                        Some((start, it))
+                    })
+                    .collect();
+
+                Entry {
+                    path: label.into(),
+                    size,
+                    subtree,
+                    color,
+                    is_group: true,
+                }
+            }
+        })
+        .collect();
+
+    entries.sort_by_key(|it| Reverse(it.size));
+    entries
 }
 
 #[instrument]
@@ -167,7 +230,7 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     let target = args.path;
-    let scanned = scan_fs(&target)?;
+    let scanned = scan_fs(&target, args.group)?;
 
     ratatui::run(|terminal| App::new(&target, scanned).run(terminal))
 }
@@ -408,16 +471,14 @@ fn render_subtree(area: Rect, buf: &mut Buffer, tree: TreeSlice, selection: &[us
 
     // TODO: render with this if partition results in a small block
     // Can't display useful information if area is too small
-    if area.height < 2 || area.width <= 2 {
+    if tree.len() > 1 && (area.height < 2 || area.width <= 2) {
         let head = selection.first();
+        let color = tree.first().map(|(_, it)| it.color).unwrap_or_default();
+        let style = Style::from(color);
         if tree.iter().any(|(k, _)| Some(k) == head) {
-            Fill::new("▓").style(Style::new().blue()).render(area, buf);
-        } else if tree.len() == 1 {
-            Block::bordered()
-                // .border_type(ratatui::widgets::BorderType::LightDoubleDashed)
-                .render(area, buf);
+            Fill::new("▓").style(style).render(area, buf);
         } else {
-            Fill::new(symbols::DOT).render(area, buf);
+            Fill::new(symbols::DOT).style(style).render(area, buf);
         }
 
         return;
@@ -477,6 +538,7 @@ fn render_entry(area: Rect, buf: &mut Buffer, key: usize, entry: &Entry, selecti
         path,
         size,
         subtree,
+        is_group,
         ..
     } = entry;
 
@@ -493,13 +555,16 @@ fn render_entry(area: Rect, buf: &mut Buffer, key: usize, entry: &Entry, selecti
 
     let mut block = Block::bordered()
         .title(display.to_line())
-        .title_bottom(format_size(*size, DECIMAL))
         .border_style(style);
+
+    if area.height > 1 {
+        block = block.title_bottom(format_size(*size, DECIMAL));
+    }
 
     if selected {
         block = block.border_type(ratatui::widgets::BorderType::QuadrantInside);
         // block = block.border_type(ratatui::widgets::BorderType::Thick);
-    } else if subtree.is_empty() {
+    } else if *is_group || subtree.is_empty() {
         block = block.border_type(ratatui::widgets::BorderType::LightQuadrupleDashed);
     }
 
