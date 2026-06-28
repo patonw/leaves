@@ -1,5 +1,6 @@
 use std::cmp::Reverse;
 use std::convert::identity;
+use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
@@ -13,7 +14,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Position};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols;
 use ratatui::text::ToLine as _;
-use ratatui::widgets::{Borders, Fill, Padding, ScrollbarOrientation};
+use ratatui::widgets::{Borders, Fill, Padding, Paragraph, ScrollbarOrientation, Wrap};
 use ratatui::{
     DefaultTerminal, Frame,
     buffer::Buffer,
@@ -41,6 +42,24 @@ pub struct Entry {
     path: PathBuf,
     size: usize,
     subtree: DirTree,
+    color: Color,
+}
+
+#[ouroboros::self_referencing]
+pub struct TreeFocus {
+    tree: DirTree,
+
+    #[borrows(tree)]
+    #[covariant]
+    focus: Option<&'this Entry>,
+}
+
+impl TreeFocus {
+    pub fn select(&mut self, selection: &[usize]) {
+        self.with_mut(|fields| {
+            *fields.focus = get_selection(selection, fields.tree);
+        });
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -59,9 +78,12 @@ impl<P: AsRef<Path>> From<(P, usize)> for Entry {
             path,
             size,
             subtree: Default::default(),
+            color: Color::Reset,
         }
     }
 }
+
+// TODO: group small sibling files by type
 
 fn scan_fs<P: AsRef<Path>>(path: P) -> Result<DirTree> {
     let mut entries = std::fs::read_dir(path)?
@@ -72,20 +94,42 @@ fn scan_fs<P: AsRef<Path>>(path: P) -> Result<DirTree> {
                 let range = key_range(subtree.as_slice()).unwrap_or_default();
                 let size = range.len();
 
+                let mut h = DefaultHasher::default();
+                format!("{}", ent.path().file_name().unwrap_or_default().display()).hash(&mut h);
+                let id = h.finish();
+
+                // let color = colorous::TABLEAU10[id as usize % 10];
+                let color = colorous::VIRIDIS.eval_rational(id as usize, u64::MAX as usize);
+
                 if size > 0 {
                     Ok(Some(Entry {
                         path: ent.path(),
                         size,
                         subtree,
+                        color: Color::Rgb(color.r, color.g, color.b),
                     }))
                 } else {
                     Ok(None)
                 }
             } else if metadata.is_file() && metadata.len() > 0 {
+                let color = if let Some(ext) = ent.path().extension() {
+                    let mut h = DefaultHasher::default();
+                    format!("{}", ext.display()).hash(&mut h);
+                    let id = h.finish();
+
+                    // let color = colorous::TABLEAU10[id as usize % 10];
+                    let color =
+                        colorous::YELLOW_ORANGE_BROWN.eval_rational(id as usize, u64::MAX as usize);
+                    Color::Rgb(color.r, color.g, color.b)
+                } else {
+                    Color::Reset
+                };
+
                 Ok(Some(Entry {
                     path: ent.path(),
                     size: metadata.len() as usize,
                     subtree: Default::default(),
+                    color,
                 }))
             } else {
                 // TODO: deal with hard links possibly at different levels
@@ -165,11 +209,10 @@ fn key_range(whole: TreeSlice) -> Option<Range<usize>> {
     Some((start)..end)
 }
 
-#[derive(Debug, Default)]
 pub struct App {
     exit: bool,
     path: PathBuf,
-    entries: DirTree,
+    entries: TreeFocus,
 
     state: TreeState<usize>,
     tree_items: Vec<TreeItem<'static, usize>>,
@@ -179,11 +222,18 @@ pub struct App {
 impl App {
     pub fn new(path: impl Into<PathBuf>, entries: DirTree) -> Self {
         let tree_items = tree_items(entries.as_slice());
+        let focus = TreeFocusBuilder {
+            tree: entries.clone(),
+            focus_builder: |_| None,
+        }
+        .build();
         Self {
             path: path.into(),
-            entries,
+            entries: focus,
             tree_items,
-            ..Default::default()
+            exit: false,
+            state: Default::default(),
+            selection: Default::default(),
         }
     }
 
@@ -195,7 +245,9 @@ impl App {
 
         while !self.exit {
             terminal.draw(|frame| self.draw(frame))?;
-            self.handle_events()?;
+            if self.handle_events()? {
+                self.entries.select(self.state.selected());
+            }
         }
 
         Ok(())
@@ -242,11 +294,19 @@ impl App {
             .highlight_symbol(">> ");
 
         frame.render_stateful_widget(widget, sidebar[0], &mut self.state);
-        frame.render_widget(&*self, layout[1]);
+        if let Some(entry) = self.entries.borrow_focus() {
+            frame.render_widget(
+                Paragraph::new(format!("{}", entry.path.display()))
+                    .block(Block::new().padding(Padding::proportional(1)))
+                    .wrap(Wrap { trim: false }),
+                sidebar[1],
+            );
+        }
+        frame.render_widget(self, layout[1]);
     }
 
-    fn handle_events(&mut self) -> Result<()> {
-        match event::read()? {
+    fn handle_events(&mut self) -> Result<bool> {
+        let dirty = match event::read()? {
             // it's important to check that the event is a key press event as
             // crossterm also emits key release and repeat events on Windows.
             Event::Key(key_event) if key_event.kind == KeyEventKind::Press => {
@@ -254,23 +314,24 @@ impl App {
             }
             Event::Mouse(mouse) => {
                 let app = self;
-                let _ = match mouse.kind {
+                match mouse.kind {
                     MouseEventKind::ScrollDown => app.state.scroll_down(1),
                     MouseEventKind::ScrollUp => app.state.scroll_up(1),
                     MouseEventKind::Down(_button) => {
                         app.state.click_at(Position::new(mouse.column, mouse.row))
                     }
                     _ => false,
-                };
+                }
             }
-            _ => {}
+            _ => false,
         };
-        Ok(())
+
+        Ok(dirty)
     }
 
-    fn handle_key_event(&mut self, key: KeyEvent) {
+    fn handle_key_event(&mut self, key: KeyEvent) -> bool {
         let app = self;
-        let _ = match key.code {
+        match key.code {
             KeyCode::Char('q') => app.exit(),
             KeyCode::Char('\n' | ' ') => app.state.toggle_selected(),
             KeyCode::Left => app.state.key_left(),
@@ -283,13 +344,32 @@ impl App {
             KeyCode::PageDown => app.state.scroll_down(3),
             KeyCode::PageUp => app.state.scroll_up(3),
             _ => false,
-        };
+        }
     }
 
     fn exit(&mut self) -> bool {
         self.exit = true;
         false
     }
+}
+
+fn get_selection<'a>(
+    mut selection: &[usize],
+    mut level: &'a [(usize, Entry)],
+) -> Option<&'a Entry> {
+    while let Some(id) = selection.first()
+        && let Ok(idx) = level.binary_search_by_key(id, |(k, _)| *k)
+    {
+        let entry = &level[idx].1;
+        if selection.len() == 1 {
+            return Some(entry);
+        }
+
+        selection = &selection[1..];
+        level = &entry.subtree;
+    }
+
+    None
 }
 
 fn tree_items(entries: TreeSlice) -> Vec<TreeItem<'static, usize>> {
@@ -315,9 +395,9 @@ fn tree_items(entries: TreeSlice) -> Vec<TreeItem<'static, usize>> {
         .collect_vec()
 }
 
-impl Widget for &App {
+impl Widget for &mut App {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        render_subtree(area, buf, &self.entries, &self.selection);
+        render_subtree(area, buf, self.entries.borrow_tree(), &self.selection);
     }
 }
 
@@ -343,10 +423,6 @@ fn render_subtree(area: Rect, buf: &mut Buffer, tree: TreeSlice, selection: &[us
         return;
     }
 
-    let Some(total) = key_range(tree).map(|r| r.len() as u32) else {
-        return;
-    };
-
     if tree.len() == 1 {
         let (key, entry) = &tree[0];
 
@@ -363,8 +439,13 @@ fn render_subtree(area: Rect, buf: &mut Buffer, tree: TreeSlice, selection: &[us
             //     .render(area, buf);
         }
         MaybePair::Two(left, right) => {
-            let l = key_range(left).map(|r| (r.end - r.start) as u32).unwrap();
-            let r = key_range(right).map(|r| (r.end - r.start) as u32).unwrap();
+            let l = key_range(left).map(|r| (r.end - r.start) as f32).unwrap();
+            let r = key_range(right).map(|r| (r.end - r.start) as f32).unwrap();
+
+            // Must interpolate multi-gigabytes down to u16 range
+            let lr = (l + r) / 1E5;
+            let l = (l / lr) as u16;
+            let r = (r / lr) as u16;
 
             let direction = if area.width > area.height * 2 {
                 Direction::Horizontal
@@ -374,19 +455,16 @@ fn render_subtree(area: Rect, buf: &mut Buffer, tree: TreeSlice, selection: &[us
 
             let mut layout = Layout::default()
                 .direction(direction)
-                .constraints(vec![
-                    Constraint::Ratio(l, l + r),
-                    Constraint::Ratio(r, l + r),
-                ])
+                .constraints(vec![Constraint::Fill(l), Constraint::Fill(r)])
                 .split(area);
 
-            // // Ensure tiny left-overs are always represented even if it skews proportions
-            // if layout[1].width == 0 || layout[1].height == 0 {
-            //     layout = Layout::default()
-            //         .direction(direction)
-            //         .constraints(vec![Constraint::Percentage(100), Constraint::Min(1)])
-            //         .split(area);
-            // }
+            // Ensure tiny left-overs are always represented even if it skews proportions
+            if layout[1].width == 0 || layout[1].height == 0 {
+                layout = Layout::default()
+                    .direction(direction)
+                    .constraints(vec![Constraint::Percentage(100), Constraint::Min(1)])
+                    .split(area);
+            }
 
             render_subtree(layout[0], buf, left, selection);
             render_subtree(layout[1], buf, right, selection);
@@ -404,9 +482,6 @@ fn render_entry(area: Rect, buf: &mut Buffer, key: usize, entry: &Entry, selecti
 
     let title = path.file_name().unwrap_or_default();
     let display = title.display();
-    let mut block = Block::bordered()
-        .title(display.to_line())
-        .title_bottom(format_size(*size, DECIMAL));
 
     let (selected, selection) = if selection.first() == Some(&key) {
         (true, &selection[1..])
@@ -414,15 +489,18 @@ fn render_entry(area: Rect, buf: &mut Buffer, key: usize, entry: &Entry, selecti
         (false, [].as_slice())
     };
 
-    let style = if selected {
-        Style::new().blue()
-    } else {
-        Default::default()
-    };
+    let style = Style::from(entry.color);
+
+    let mut block = Block::bordered()
+        .title(display.to_line())
+        .title_bottom(format_size(*size, DECIMAL))
+        .border_style(style);
+
     if selected {
-        block = block
-            .border_type(ratatui::widgets::BorderType::Thick)
-            .border_style(style);
+        block = block.border_type(ratatui::widgets::BorderType::QuadrantInside);
+        // block = block.border_type(ratatui::widgets::BorderType::Thick);
+    } else if subtree.is_empty() {
+        block = block.border_type(ratatui::widgets::BorderType::LightQuadrupleDashed);
     }
 
     let inner = block.inner(area);
