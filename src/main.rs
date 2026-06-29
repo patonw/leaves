@@ -1,5 +1,5 @@
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::identity;
 use std::ffi::OsString;
 use std::hash::{DefaultHasher, Hash as _, Hasher as _};
@@ -13,6 +13,7 @@ use crossterm::ExecutableCommand as _;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, MouseEventKind, poll};
 use eyre::Context as _;
 use humansize::{DECIMAL, format_size};
+use ignore::overrides::OverrideBuilder;
 use itertools::Itertools as _;
 use ratatui::layout::{Constraint, Direction, Layout, Position};
 use ratatui::style::{Color, Modifier, Style};
@@ -34,18 +35,38 @@ use clap::Parser;
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct Args {
+    /// Scanning root path
     #[arg(default_value = ".")]
     path: PathBuf,
 
     /// Group files in a directory by extension
     #[arg(short, long)]
     group: bool,
+
+    /// Don't skip hidden files and folders
+    #[arg(short = 'H', long)]
+    include_hidden: bool,
+
+    /// Don't skip .ignore'd files
+    #[arg(short = 'I', long)]
+    include_ignored: bool,
+
+    /// Don't skip .gitignore'd files and folders
+    #[arg(short = 'G', long)]
+    include_gitignored: bool,
+
+    /// Don't skip files and folders listed in .git/info/exclude
+    #[arg(short = 'E', long)]
+    include_gitexcluded: bool,
+
+    /// Git-style override globs. '!' prefix negates glob
+    overrides: Vec<String>,
 }
 
 type DirTree = Vec<(usize, Entry)>;
 type TreeSlice<'a> = &'a [(usize, Entry)];
 
-#[derive(Default, Clone, Debug)]
+#[derive(Default, Clone, Debug, Hash, Eq, PartialEq)]
 pub struct Entry {
     path: PathBuf,
     size: usize,
@@ -93,6 +114,7 @@ impl<P: AsRef<Path>> From<(P, usize)> for Entry {
     }
 }
 
+#[allow(unused)]
 fn scan_fs<P: AsRef<Path>>(
     state: Arc<Mutex<ScanState>>,
     path: P,
@@ -112,37 +134,21 @@ fn scan_fs<P: AsRef<Path>>(
                 let range = key_range(subtree.as_slice()).unwrap_or_default();
                 let size = range.len();
 
-                let mut h = DefaultHasher::default();
-                format!("{}", ent.path().file_name().unwrap_or_default().display()).hash(&mut h);
-                let id = h.finish();
-
-                // let color = colorous::TABLEAU10[id as usize % 10];
-                let color = colorous::VIRIDIS.eval_rational(id as usize, u64::MAX as usize);
+                let color = dir_color(ent.path());
 
                 if size > 0 {
                     Ok(Some(Entry {
                         path: ent.path(),
                         size,
                         subtree,
-                        color: Color::Rgb(color.r, color.g, color.b),
+                        color,
                         is_group: false,
                     }))
                 } else {
                     Ok(None)
                 }
             } else if metadata.is_file() && metadata.len() > 0 {
-                let color = if let Some(ext) = ent.path().extension() {
-                    let mut h = DefaultHasher::default();
-                    format!("{}", ext.display()).hash(&mut h);
-                    let id = h.finish();
-
-                    // let color = colorous::TABLEAU10[id as usize % 10];
-                    let color =
-                        colorous::YELLOW_ORANGE_BROWN.eval_rational(id as usize, u64::MAX as usize);
-                    Color::Rgb(color.r, color.g, color.b)
-                } else {
-                    Color::Reset
-                };
+                let color = file_color(ent.path());
                 {
                     let mut state = state.lock().unwrap();
                     state.total += metadata.len() as usize;
@@ -171,14 +177,21 @@ fn scan_fs<P: AsRef<Path>>(
         entries = regroup(entries);
     }
 
-    Ok(entries
-        .into_iter()
-        .scan(0, |acc, it| {
-            let start = *acc;
-            *acc += it.size;
-            Some((start, it))
-        })
-        .collect())
+    Ok(cumsum_size(entries))
+}
+
+fn dir_color(dir_path: impl AsRef<Path>) -> Color {
+    let mut h = DefaultHasher::default();
+    format!(
+        "{}",
+        dir_path.as_ref().file_name().unwrap_or_default().display()
+    )
+    .hash(&mut h);
+    let id = h.finish();
+
+    // let color = colorous::TABLEAU10[id as usize % 10];
+    let color = colorous::VIRIDIS.eval_rational(id as usize, u64::MAX as usize);
+    Color::from(color.into_tuple())
 }
 
 fn regroup(entries: Vec<Entry>) -> Vec<Entry> {
@@ -208,14 +221,7 @@ fn regroup(entries: Vec<Entry>) -> Vec<Entry> {
                 let label = format!("*.{}", k.display());
                 let size = v.iter().map(|it| it.size).sum();
                 let color = v[0].color;
-                let subtree = v
-                    .into_iter()
-                    .scan(0, |acc, it| {
-                        let start = *acc;
-                        *acc += it.size;
-                        Some((start, it))
-                    })
-                    .collect();
+                let subtree = cumsum_size(v);
 
                 Entry {
                     path: label.into(),
@@ -232,6 +238,125 @@ fn regroup(entries: Vec<Entry>) -> Vec<Entry> {
     entries
 }
 
+fn cumsum_size(entries: Vec<Entry>) -> Vec<(usize, Entry)> {
+    entries
+        .into_iter()
+        .scan(0, |acc, it| {
+            let start = *acc;
+            *acc += it.size;
+            Some((start, it))
+        })
+        .collect()
+}
+
+fn walk_fs(args: &Args, state: Arc<Mutex<ScanState>>) -> Result<DirTree> {
+    let root = args.path.canonicalize()?;
+    let mut kidding: HashMap<PathBuf, HashSet<Entry>> = Default::default();
+
+    let mut overrides = OverrideBuilder::new(&root);
+    for glob in &args.overrides {
+        overrides.add(glob)?;
+    }
+
+    let walker = ignore::WalkBuilder::new(&root)
+        .overrides(overrides.build()?)
+        .hidden(!args.include_hidden)
+        .ignore(!args.include_ignored)
+        .git_ignore(!args.include_gitignored)
+        .git_exclude(!args.include_gitexcluded)
+        .build();
+
+    for result in walker {
+        // Each item yielded by the iterator is either a directory entry or an
+        // error, so either print the path or the error.
+        match result {
+            Ok(ent) => {
+                {
+                    let mut state = state.lock().unwrap();
+                    state.count += 1;
+                    state.path = ent.path().into();
+                }
+
+                let metadata = ent.metadata()?;
+                if metadata.is_file() && metadata.len() > 0 {
+                    let mut state = state.lock().unwrap();
+                    state.total += metadata.len() as usize;
+                } else {
+                    continue;
+                }
+
+                let color = file_color(ent.path());
+                let mut cursor = Entry {
+                    path: ent.path().into(),
+                    size: metadata.len() as usize,
+                    subtree: Default::default(),
+                    color,
+                    is_group: false,
+                };
+
+                while let Some(parent) = cursor.path.parent() {
+                    let parent = parent.to_path_buf();
+                    let siblings = kidding.entry(parent.clone()).or_default();
+                    if siblings.contains(&cursor) {
+                        break;
+                    }
+
+                    siblings.insert(cursor);
+                    let color = dir_color(&parent);
+                    cursor = Entry {
+                        path: parent,
+                        color,
+                        ..Default::default()
+                    }
+                }
+            }
+            Err(err) => tracing::warn!("{}", err),
+        }
+    }
+
+    Ok(treeify(args, &mut kidding, &root))
+}
+
+fn treeify(args: &Args, kidding: &mut HashMap<PathBuf, HashSet<Entry>>, path: &Path) -> DirTree {
+    let Some(entries) = kidding.remove(path) else {
+        return Default::default();
+    };
+
+    let mut entries = entries
+        .into_iter()
+        .map(|mut it| {
+            let subtree = treeify(args, kidding, &it.path);
+            if !subtree.is_empty() {
+                it.size = subtree.iter().map(|(_, it)| it.size).sum();
+            }
+            it.subtree = subtree;
+            it
+        })
+        .collect_vec();
+
+    entries.sort_by_key(|it| Reverse(it.size));
+
+    if args.group {
+        entries = regroup(entries);
+    }
+
+    cumsum_size(entries)
+}
+
+fn file_color(file_path: impl AsRef<Path>) -> Color {
+    if let Some(ext) = file_path.as_ref().extension() {
+        let mut h = DefaultHasher::default();
+        format!("{}", ext.display()).hash(&mut h);
+        let id = h.finish();
+
+        // let color = colorous::TABLEAU10[id as usize % 10];
+        let color = colorous::YELLOW_ORANGE_BROWN.eval_rational(id as usize, u64::MAX as usize);
+        Color::from(color.into_tuple())
+    } else {
+        Color::Reset
+    }
+}
+
 #[instrument]
 fn main() -> Result<()> {
     use tracing_subscriber::{EnvFilter, fmt, prelude::*};
@@ -245,15 +370,13 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    let target = args.path;
+    let target = args.path.clone();
     let scan_state = Arc::new(Mutex::new(ScanState::default()));
 
     let th = {
         let state = scan_state.clone();
-        let target = target.clone();
-        let group = args.group;
         std::thread::spawn(move || {
-            let result = scan_fs(state.clone(), &target, group);
+            let result = walk_fs(&args, state.clone());
             let mut state = state.lock().unwrap();
             state.done = true;
             result
