@@ -514,6 +514,7 @@ pub struct App {
     state: TreeState<usize>,
     tree_items: Vec<TreeItem<'static, usize>>,
     selection: Vec<usize>,
+    skip_view: Vec<usize>,
 }
 
 impl App {
@@ -531,6 +532,7 @@ impl App {
             exit: false,
             state: Default::default(),
             selection: Default::default(),
+            skip_view: Default::default(),
         }
     }
 
@@ -543,7 +545,10 @@ impl App {
         while !self.exit {
             terminal.draw(|frame| self.draw(frame))?;
             if self.handle_events()? {
-                self.entries.select(self.state.selected());
+                let mut selection = self.skip_view.clone();
+                selection.extend(self.state.selected());
+
+                self.entries.select(&selection);
             }
         }
 
@@ -559,13 +564,18 @@ impl App {
 
         let sidebar = Layout::default()
             .direction(Direction::Vertical)
-            .constraints(vec![Constraint::Fill(10), Constraint::Percentage(25)])
+            .constraints(vec![
+                Constraint::Fill(10),
+                Constraint::Length(2),
+                Constraint::Percentage(25),
+            ])
             .split(layout[0]);
 
         self.selection.clear();
         self.selection.extend_from_slice(self.state.selected());
 
-        let title = self.path.display();
+        let title = self.view_path().unwrap_or(&self.path).to_owned();
+        let title = title.display();
         let widget = Tree::new(&self.tree_items)
             .expect("all item identifiers are unique")
             .block(
@@ -573,8 +583,7 @@ impl App {
                     .borders(Borders::TOP | Borders::BOTTOM)
                     .border_type(ratatui::widgets::BorderType::Double)
                     .padding(Padding::proportional(1))
-                    .title(title.to_line().centered())
-                    .title_bottom(format!("{:?}", self.state.selected())),
+                    .title(title.to_line().centered()),
             )
             .experimental_scrollbar(Some(
                 Scrollbar::new(ScrollbarOrientation::VerticalRight)
@@ -591,12 +600,20 @@ impl App {
             .highlight_symbol(">> ");
 
         frame.render_stateful_widget(widget, sidebar[0], &mut self.state);
+
+        let text = vec![
+            format!("{:?}", self.state.selected()),
+            format!("{:?}", &self.skip_view),
+        ];
+        let text = Text::from(text.into_iter().map(Line::from).collect_vec());
+        frame.render_widget(Paragraph::new(text), sidebar[1]);
+
         if let Some(entry) = self.entries.borrow_focus() {
             frame.render_widget(
                 Paragraph::new(format!("{}", entry.path.display()))
                     .block(Block::new().padding(Padding::proportional(1)))
                     .wrap(Wrap { trim: false }),
-                sidebar[1],
+                sidebar[2],
             );
         }
         frame.render_widget(self, layout[1]);
@@ -627,19 +644,39 @@ impl App {
     }
 
     fn handle_key_event(&mut self, key: KeyEvent) -> bool {
-        let app = self;
         match key.code {
-            KeyCode::Char('q') => app.exit(),
-            KeyCode::Char('\n' | ' ') => app.state.toggle_selected(),
-            KeyCode::Left => app.state.key_left(),
-            KeyCode::Right => app.state.key_right(),
-            KeyCode::Down => app.state.key_down(),
-            KeyCode::Up => app.state.key_up(),
-            KeyCode::Esc => app.state.select(Vec::new()),
-            KeyCode::Home => app.state.select_first(),
-            KeyCode::End => app.state.select_last(),
-            KeyCode::PageDown => app.state.scroll_down(3),
-            KeyCode::PageUp => app.state.scroll_up(3),
+            KeyCode::Char('q') => self.exit(),
+            KeyCode::Char('\n' | ' ') => self.state.toggle_selected(),
+            KeyCode::Left => self.state.key_left(),
+            KeyCode::Right => self.state.key_right(),
+            KeyCode::Down => self.state.key_down(),
+            KeyCode::Up => self.state.key_up(),
+            KeyCode::Esc => self.state.select(Vec::new()),
+            KeyCode::Home => self.state.select_first(),
+            KeyCode::End => self.state.select_last(),
+            KeyCode::PageDown => self.state.scroll_down(3),
+            KeyCode::PageUp => self.state.scroll_up(3),
+            KeyCode::Enter => {
+                self.skip_view.extend_from_slice(self.state.selected());
+                self.selection.clear();
+                self.tree_items = tree_items(self.get_view());
+                self.state.select(self.selection.clone());
+                for i in 0..self.selection.len() {
+                    self.state.open(self.selection[..i].to_vec());
+                }
+                true
+            }
+            KeyCode::Backspace => {
+                if let Some(id) = self.skip_view.pop() {
+                    self.selection.insert(0, id);
+                }
+                self.tree_items = tree_items(self.get_view());
+                self.state.select(self.selection.clone());
+                for i in 0..self.selection.len() {
+                    self.state.open(self.selection[..i].to_vec());
+                }
+                true
+            }
             _ => false,
         }
     }
@@ -647,6 +684,24 @@ impl App {
     fn exit(&mut self) -> bool {
         self.exit = true;
         false
+    }
+
+    fn view_path(&self) -> Option<&Path> {
+        let view = self.get_view();
+        view[0].1.path.parent()
+    }
+
+    fn get_view(&self) -> &[(usize, Entry)] {
+        self.skip_view
+            .iter()
+            .fold(self.entries.borrow_tree().as_slice(), |view, id| {
+                if let Ok(idx) = view.binary_search_by_key(id, |(id, _)| *id) {
+                    let subtree = &view[idx].1.subtree;
+                    if subtree.is_empty() { view } else { subtree }
+                } else {
+                    view
+                }
+            })
     }
 }
 
@@ -691,10 +746,11 @@ fn tree_items(entries: TreeSlice) -> Vec<TreeItem<'static, usize>> {
         })
         .collect_vec()
 }
-
 impl Widget for &mut App {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        render_subtree(area, buf, self.entries.borrow_tree(), &self.selection);
+        let tree = self.get_view();
+
+        render_subtree(area, buf, tree, &self.selection);
     }
 }
 
