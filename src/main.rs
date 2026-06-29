@@ -5,17 +5,19 @@ use std::ffi::OsString;
 use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use color_eyre::Result;
 use crossterm::ExecutableCommand as _;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, MouseEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, MouseEventKind, poll};
 use eyre::Context as _;
 use humansize::{DECIMAL, format_size};
 use itertools::Itertools as _;
 use ratatui::layout::{Constraint, Direction, Layout, Position};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols;
-use ratatui::text::ToLine as _;
+use ratatui::text::{Line, Text, ToLine as _};
 use ratatui::widgets::{Borders, Fill, Padding, Paragraph, ScrollbarOrientation, Wrap};
 use ratatui::{
     DefaultTerminal, Frame,
@@ -91,12 +93,22 @@ impl<P: AsRef<Path>> From<(P, usize)> for Entry {
     }
 }
 
-fn scan_fs<P: AsRef<Path>>(path: P, make_groups: bool) -> Result<DirTree> {
+fn scan_fs<P: AsRef<Path>>(
+    state: Arc<Mutex<ScanState>>,
+    path: P,
+    make_groups: bool,
+) -> Result<DirTree> {
     let mut entries = std::fs::read_dir(path)?
         .map_ok(|ent| -> Result<_> {
+            {
+                let mut state = state.lock().unwrap();
+                state.count += 1;
+                state.path = ent.path();
+            }
+
             let metadata = ent.metadata()?;
             if metadata.is_dir() {
-                let subtree = scan_fs(ent.path(), make_groups)?;
+                let subtree = scan_fs(state.clone(), ent.path(), make_groups)?;
                 let range = key_range(subtree.as_slice()).unwrap_or_default();
                 let size = range.len();
 
@@ -131,6 +143,10 @@ fn scan_fs<P: AsRef<Path>>(path: P, make_groups: bool) -> Result<DirTree> {
                 } else {
                     Color::Reset
                 };
+                {
+                    let mut state = state.lock().unwrap();
+                    state.total += metadata.len() as usize;
+                }
 
                 Ok(Some(Entry {
                     path: ent.path(),
@@ -230,7 +246,28 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     let target = args.path;
-    let scanned = scan_fs(&target, args.group)?;
+    let scan_state = Arc::new(Mutex::new(ScanState::default()));
+
+    let th = {
+        let state = scan_state.clone();
+        let target = target.clone();
+        let group = args.group;
+        std::thread::spawn(move || {
+            let result = scan_fs(state.clone(), &target, group);
+            let mut state = state.lock().unwrap();
+            state.done = true;
+            result
+        })
+    };
+
+    let quit = ratatui::run(|term| ScanUI::new(scan_state).run(term))?;
+    if quit {
+        return Ok(());
+    }
+
+    let scanned = th
+        .join()
+        .map_err(|_e| eyre::eyre!("Failed to spawn scanner"))??;
 
     ratatui::run(|terminal| App::new(&target, scanned).run(terminal))
 }
@@ -270,6 +307,80 @@ fn key_range(whole: TreeSlice) -> Option<Range<usize>> {
     let end = end.0 + end.1.size;
 
     Some((start)..end)
+}
+
+#[derive(Default, Clone)]
+pub struct ScanState {
+    done: bool,
+    path: PathBuf,
+    count: usize,
+    total: usize,
+}
+
+#[derive(Default)]
+pub struct ScanUI {
+    done: bool,
+    quit: bool,
+    state: Arc<Mutex<ScanState>>,
+}
+
+impl ScanUI {
+    pub fn new(state: Arc<Mutex<ScanState>>) -> Self {
+        Self {
+            state,
+            ..Default::default()
+        }
+    }
+
+    pub fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<bool> {
+        while !self.quit && !self.done {
+            let state = {
+                let state = self.state.lock().unwrap();
+                self.done = state.done;
+                (*state).clone()
+            };
+
+            terminal.draw(|frame| self.draw(frame, state))?;
+            self.handle_events()?;
+        }
+
+        Ok(self.quit)
+    }
+
+    fn draw(&self, frame: &mut Frame, state: ScanState) {
+        let area = frame.area();
+        let buf = frame.buffer_mut();
+
+        let lines = vec![
+            format!("Scanning {}", state.path.display()),
+            format!("Count: {}", state.count),
+            format!("Total: {}", format_size(state.total, DECIMAL)),
+        ]
+        .into_iter()
+        .map(Line::from)
+        .collect_vec();
+        let text = Text::from(lines);
+        Paragraph::new(text).render(area, buf);
+    }
+
+    fn handle_events(&mut self) -> Result<()> {
+        if !poll(Duration::from_millis(100))? {
+            return Ok(());
+        }
+
+        match event::read()? {
+            // it's important to check that the event is a key press event as
+            // crossterm also emits key release and repeat events on Windows.
+            Event::Key(key_event) if key_event.kind == KeyEventKind::Press => {
+                if let KeyCode::Char('q') = key_event.code {
+                    self.quit = true;
+                }
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
 }
 
 pub struct App {
