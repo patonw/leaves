@@ -19,7 +19,9 @@ use ratatui::layout::{Constraint, Direction, Layout, Position};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols;
 use ratatui::text::{Line, Text, ToLine as _};
-use ratatui::widgets::{Borders, Fill, Padding, Paragraph, ScrollbarOrientation, Wrap};
+use ratatui::widgets::{
+    Borders, Fill, Padding, Paragraph, ScrollbarOrientation, StatefulWidget, Wrap,
+};
 use ratatui::{
     DefaultTerminal, Frame,
     buffer::Buffer,
@@ -73,12 +75,65 @@ pub struct Args {
 
 type Forest = Vec<(usize, Entry)>;
 type TreeSlice<'a> = &'a [(usize, Entry)];
-type LineageMap = HashMap<(PathBuf, OsString), HashSet<Entry>>;
+type LineageMap = HashMap<(PathBuf, Option<OsString>), HashSet<Entry>>;
+
+#[derive(Clone, Default)]
+pub struct StackAddr<'a>(Option<(usize, &'a StackAddr<'a>)>);
+
+impl<'a> Iterator for &StackAddr<'a> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (data, prev) = self.0.as_ref()?;
+        *self = *prev;
+        Some(*data)
+    }
+}
+
+impl<'a> StackAddr<'a> {
+    pub fn root() -> Self {
+        Self::default()
+    }
+
+    pub fn push(&'a self, data: usize) -> Self {
+        Self(Some((data, self)))
+    }
+}
+
+pub fn tree_find_path(
+    tree: TreeSlice,
+    path: &Path,
+    tag: Option<&OsStr>,
+    addr: &StackAddr,
+) -> Option<Vec<usize>> {
+    for (id, entry) in tree {
+        let addr = addr.push(*id);
+        let mut found = entry.path == path;
+
+        if let Some(stag) = tag
+            && let Some(etag) = &entry.tag
+        {
+            found = found && stag == etag;
+        }
+
+        if found {
+            let mut result = addr.collect_vec();
+            result.reverse();
+            return Some(result);
+        }
+
+        if let Some(result) = tree_find_path(&entry.subtree, path, tag, &addr) {
+            return Some(result);
+        }
+    }
+
+    None
+}
 
 #[derive(Default, Clone, Debug, Hash, Eq, PartialEq)]
 pub struct Entry {
     path: PathBuf,
-    tag: OsString,
+    tag: Option<OsString>,
     size: usize,
     subtree: Forest,
     color: Color,
@@ -331,7 +386,7 @@ fn make_forest(args: &Args, leaves: Vec<Entry>) -> Vec<(usize, Entry)> {
         let mut entries = extensions
             .iter()
             .map(|ext| {
-                let subtree = treeify(args, &mut kidding, &root, ext);
+                let subtree = treeify(args, &mut kidding, &root, &Some(ext.clone()));
                 let size = if !subtree.is_empty() {
                     subtree.iter().map(|(_, it)| it.size).sum()
                 } else {
@@ -359,7 +414,7 @@ fn make_forest(args: &Args, leaves: Vec<Entry>) -> Vec<(usize, Entry)> {
         entries.sort_by_key(|it| Reverse(it.size));
         cumsum_size(entries)
     } else {
-        treeify(args, &mut kidding, &root, Default::default())
+        treeify(args, &mut kidding, &root, &Default::default())
     }
 }
 
@@ -379,18 +434,20 @@ fn deforest(forest: Forest) -> Vec<Entry> {
 }
 
 fn rehash(args: &Args, leaves: Vec<Entry>) -> (LineageMap, HashSet<OsString>) {
-    let mut kidding: HashMap<(PathBuf, OsString), HashSet<Entry>> = Default::default();
+    let mut kidding: LineageMap = Default::default();
     let mut extensions: HashSet<OsString> = Default::default();
 
     for entry in leaves {
         let ext = if args.xray {
-            entry.path.extension().unwrap_or_default()
+            // entry.path.extension().map(|s| s.to_os_string())
+            Some(entry.path.extension().unwrap_or_default().to_os_string())
         } else {
-            Default::default()
-        }
-        .to_os_string();
+            None
+        };
 
-        extensions.insert(ext.clone());
+        if let Some(ext) = &ext {
+            extensions.insert(ext.clone());
+        }
 
         let mut cursor = entry;
 
@@ -414,13 +471,8 @@ fn rehash(args: &Args, leaves: Vec<Entry>) -> (LineageMap, HashSet<OsString>) {
     (kidding, extensions)
 }
 
-fn treeify(
-    args: &Args,
-    kidding: &mut HashMap<(PathBuf, OsString), HashSet<Entry>>,
-    path: &Path,
-    ext: &OsStr,
-) -> Forest {
-    let key = (path.to_path_buf(), ext.to_os_string());
+fn treeify(args: &Args, kidding: &mut LineageMap, path: &Path, ext: &Option<OsString>) -> Forest {
+    let key = (path.to_path_buf(), ext.clone());
     let Some(entries) = kidding.remove(&key) else {
         return Default::default();
     };
@@ -634,13 +686,22 @@ pub struct App {
     mode_switch: bool,
 
     path: PathBuf,
-    title: Option<OsString>,
     entries: TreeFocus,
 
-    state: TreeState<usize>,
     tree_items: Vec<TreeItem<'static, usize>>,
     selection: Vec<usize>,
+}
+
+#[derive(Default)]
+pub struct AppState {
+    title: Option<OsString>,
     skip_view: Vec<usize>,
+    tree_state: TreeState<usize>,
+    tag: Option<OsString>,
+
+    click_pos: Option<Position>,
+    click_area: Rect,
+    click_addr: Vec<usize>,
 }
 
 impl App {
@@ -657,12 +718,9 @@ impl App {
             exit: false,
             mode_switch: false,
             path: path.into(),
-            title: None,
             entries: focus,
             tree_items,
-            state: Default::default(),
             selection: Default::default(),
-            skip_view: Default::default(),
         }
     }
 
@@ -672,9 +730,15 @@ impl App {
             .backend_mut()
             .execute(crossterm::event::EnableMouseCapture);
 
+        let mut state = AppState::default();
+
         while !self.exit {
             if self.mode_switch {
                 self.mode_switch = false;
+
+                let restore_view = self.view_entry(&state).path;
+                let restore_path = self.entries.borrow_focus().map(|it| it.path.to_path_buf());
+                let restore_tag = state.tag.clone();
 
                 self.args.xray = !self.args.xray;
                 let entries = std::mem::take(&mut self.entries);
@@ -690,41 +754,86 @@ impl App {
 
                 self.tree_items = tree_items(self.entries.borrow_tree());
 
-                self.title = Default::default();
-                self.state = Default::default();
                 self.selection = Default::default();
-                self.skip_view = Default::default();
+                state = AppState {
+                    tag: restore_tag.clone(),
+                    ..Default::default()
+                };
+
+                if let Some(addr) = tree_find_path(
+                    self.entries.borrow_tree(),
+                    &restore_view,
+                    restore_tag.as_deref(),
+                    &StackAddr::root(),
+                ) {
+                    state.skip_view = addr;
+                }
+
+                if let Some(path) = restore_path
+                    && let Some(addr) = tree_find_path(
+                        self.entries.borrow_tree(),
+                        &path,
+                        restore_tag.as_deref(),
+                        &StackAddr::root(),
+                    )
+                {
+                    state.click_addr = addr.into_iter().skip(state.skip_view.len()).collect_vec();
+                }
+
+                self.sync_view(&mut state);
             }
 
-            if self.title.is_none() {
-                let entry = self.view_entry();
-                if entry.tag.is_empty() {
-                    self.title = Some(entry.path.into_os_string());
-                } else {
-                    self.title = Some(
-                        entry
-                            .path
-                            .join("**")
-                            .with_extension(&entry.tag)
-                            .into_os_string(),
-                    );
+            if state.title.is_none() {
+                let entry = self.view_entry(&state);
+                if entry.tag.is_none() {
+                    state.title = Some(entry.path.into_os_string());
+                } else if let Some(tag) = &entry.tag {
+                    state.title = Some(entry.path.join("**").with_extension(tag).into_os_string());
                 }
             }
 
-            terminal.draw(|frame| self.draw(frame))?;
-            if self.handle_events()? {
-                let mut selection = self.skip_view.clone();
-                selection.extend(self.state.selected());
+            if !state.click_addr.is_empty() {
+                let addr = std::mem::take(&mut state.click_addr);
+                let mut selection = state.skip_view.clone();
+                selection.extend_from_slice(&addr);
+                self.entries.select(&selection);
+
+                for i in 0..addr.len() {
+                    state.tree_state.open(addr[..i].to_vec());
+                }
+
+                state.tree_state.select(addr);
+
+                state.click_pos = None;
+            }
+
+            self.selection.clear();
+            self.selection
+                .extend_from_slice(state.tree_state.selected());
+
+            terminal.draw(|frame| self.draw(frame, &mut state))?;
+            if self.handle_events(&mut state)? {
+                let mut selection = state.skip_view.clone();
+                selection.extend(state.tree_state.selected());
 
                 self.entries.select(&selection);
+            }
+
+            if let Some(entry) = self.entries.borrow_focus() {
+                if let Some(tag) = &entry.tag {
+                    state.tag = Some(tag.clone());
+                } else if entry.subtree.is_empty() {
+                    state.tag = Some(entry.path.extension().unwrap_or_default().to_os_string());
+                }
             }
         }
 
         Ok(())
     }
 
-    fn draw(&mut self, frame: &mut Frame) {
+    fn draw(&self, frame: &mut Frame, state: &mut AppState) {
         let area = frame.area();
+        state.click_area = area;
         let layout = Layout::default()
             .direction(Direction::Horizontal)
             .constraints(vec![Constraint::Max(50), Constraint::Fill(10)])
@@ -734,15 +843,12 @@ impl App {
             .direction(Direction::Vertical)
             .constraints(vec![
                 Constraint::Fill(10),
-                Constraint::Length(2),
+                Constraint::Length(3),
                 Constraint::Percentage(25),
             ])
             .split(layout[0]);
 
-        self.selection.clear();
-        self.selection.extend_from_slice(self.state.selected());
-
-        let title = self.title.as_deref().unwrap_or_default().display();
+        let title = state.title.as_deref().unwrap_or_default().display();
         let widget = Tree::new(&self.tree_items)
             .expect("all item identifiers are unique")
             .block(
@@ -766,92 +872,100 @@ impl App {
             )
             .highlight_symbol(">> ");
 
-        frame.render_stateful_widget(widget, sidebar[0], &mut self.state);
+        frame.render_stateful_widget(widget, sidebar[0], &mut state.tree_state);
 
         let text = vec![
-            format!("{:?}", self.state.selected()),
-            format!("{:?}", &self.skip_view),
+            format!("{:?}", &state.skip_view),
+            format!("{:?}", state.tree_state.selected()),
+            format!("active tag: {:?}", &state.tag),
         ];
         let text = Text::from(text.into_iter().map(Line::from).collect_vec());
         frame.render_widget(Paragraph::new(text), sidebar[1]);
 
         if let Some(entry) = self.entries.borrow_focus() {
+            let text = vec![
+                format!("{}", entry.path.display()),
+                format!("entry tag: {:?}", &entry.tag),
+            ];
+            let text = Text::from(text.into_iter().map(Line::from).collect_vec());
+
             frame.render_widget(
-                Paragraph::new(format!("{}", entry.path.display()))
+                Paragraph::new(text)
                     .block(Block::new().padding(Padding::proportional(1)))
                     .wrap(Wrap { trim: false }),
                 sidebar[2],
             );
         }
-        frame.render_widget(self, layout[1]);
+        frame.render_stateful_widget(self, layout[1], state);
     }
 
-    fn handle_events(&mut self) -> Result<bool> {
+    fn handle_events(&mut self, state: &mut AppState) -> Result<bool> {
         let dirty = match event::read()? {
             // it's important to check that the event is a key press event as
             // crossterm also emits key release and repeat events on Windows.
             Event::Key(key_event) if key_event.kind == KeyEventKind::Press => {
-                self.handle_key_event(key_event)
+                self.handle_key_event(state, key_event)
             }
-            Event::Mouse(mouse) => {
-                let app = self;
-                match mouse.kind {
-                    MouseEventKind::ScrollDown => app.state.scroll_down(1),
-                    MouseEventKind::ScrollUp => app.state.scroll_up(1),
-                    MouseEventKind::Down(_button) => {
-                        app.state.click_at(Position::new(mouse.column, mouse.row))
-                    }
-                    _ => false,
+            Event::Mouse(mouse) => match mouse.kind {
+                MouseEventKind::ScrollDown => state.tree_state.scroll_down(1),
+                MouseEventKind::ScrollUp => state.tree_state.scroll_up(1),
+                MouseEventKind::Down(_button) => {
+                    let position = Position::new(mouse.column, mouse.row);
+                    state.click_pos = Some(position);
+                    state.click_addr.clear();
+                    state.tree_state.click_at(position)
                 }
-            }
+                _ => false,
+            },
             _ => false,
         };
 
         Ok(dirty)
     }
 
-    fn handle_key_event(&mut self, key: KeyEvent) -> bool {
+    fn handle_key_event(&mut self, state: &mut AppState, key: KeyEvent) -> bool {
         match key.code {
             KeyCode::Char('q') => self.exit(),
             KeyCode::Char('x') => {
                 self.mode_switch = true;
                 true
             }
-            KeyCode::Char('\n' | ' ') => self.state.toggle_selected(),
-            KeyCode::Left => self.state.key_left(),
-            KeyCode::Right => self.state.key_right(),
-            KeyCode::Down => self.state.key_down(),
-            KeyCode::Up => self.state.key_up(),
-            KeyCode::Esc => self.state.select(Vec::new()),
-            KeyCode::Home => self.state.select_first(),
-            KeyCode::End => self.state.select_last(),
-            KeyCode::PageDown => self.state.scroll_down(3),
-            KeyCode::PageUp => self.state.scroll_up(3),
+            KeyCode::Char('\n' | ' ') => state.tree_state.toggle_selected(),
+            KeyCode::Left => state.tree_state.key_left(),
+            KeyCode::Right => state.tree_state.key_right(),
+            KeyCode::Down => state.tree_state.key_down(),
+            KeyCode::Up => state.tree_state.key_up(),
+            KeyCode::Esc => state.tree_state.select(Vec::new()),
+            KeyCode::Home => state.tree_state.select_first(),
+            KeyCode::End => state.tree_state.select_last(),
+            KeyCode::PageDown => state.tree_state.scroll_down(3),
+            KeyCode::PageUp => state.tree_state.scroll_up(3),
             KeyCode::Enter => {
-                self.skip_view.extend_from_slice(self.state.selected());
+                state
+                    .skip_view
+                    .extend_from_slice(state.tree_state.selected());
                 self.selection.clear();
-                self.tree_items = tree_items(self.get_view());
-                self.state.select(self.selection.clone());
-                for i in 0..self.selection.len() {
-                    self.state.open(self.selection[..i].to_vec());
-                }
-                self.title = None;
+                self.sync_view(state);
                 true
             }
             KeyCode::Backspace => {
-                if let Some(id) = self.skip_view.pop() {
+                if let Some(id) = state.skip_view.pop() {
                     self.selection.insert(0, id);
                 }
-                self.tree_items = tree_items(self.get_view());
-                self.state.select(self.selection.clone());
-                for i in 0..self.selection.len() {
-                    self.state.open(self.selection[..i].to_vec());
-                }
-                self.title = None;
+                self.sync_view(state);
                 true
             }
             _ => false,
         }
+    }
+
+    fn sync_view(&mut self, state: &mut AppState) {
+        self.tree_items = tree_items(self.get_view(state));
+        state.tree_state.select(self.selection.clone());
+        for i in 0..self.selection.len() {
+            state.tree_state.open(self.selection[..i].to_vec());
+        }
+        state.title = None;
     }
 
     fn exit(&mut self) -> bool {
@@ -859,7 +973,7 @@ impl App {
         false
     }
 
-    fn view_entry(&self) -> Entry {
+    fn view_entry(&self, state: &AppState) -> Entry {
         // A synthetic entry for the root
         let root = Entry {
             path: self.path.clone(),
@@ -868,7 +982,7 @@ impl App {
         };
         let mut cursor = &root;
 
-        for id in self.skip_view.iter() {
+        for id in state.skip_view.iter() {
             if let Ok(idx) = cursor.subtree.binary_search_by_key(id, |(id, _)| *id) {
                 cursor = &cursor.subtree[idx].1;
             }
@@ -877,8 +991,9 @@ impl App {
         cursor.clone()
     }
 
-    fn get_view(&self) -> &[(usize, Entry)] {
-        self.skip_view
+    fn get_view(&self, state: &AppState) -> &[(usize, Entry)] {
+        state
+            .skip_view
             .iter()
             .fold(self.entries.borrow_tree().as_slice(), |view, id| {
                 if let Ok(idx) = view.binary_search_by_key(id, |(id, _)| *id) {
@@ -932,20 +1047,28 @@ fn tree_items(entries: TreeSlice) -> Vec<TreeItem<'static, usize>> {
         })
         .collect_vec()
 }
-impl Widget for &mut App {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        let tree = self.get_view();
+impl StatefulWidget for &App {
+    type State = AppState;
 
-        render_subtree(area, buf, tree, &self.selection);
+    fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
+        let tree = self.get_view(state);
+
+        render_subtree(state, &StackAddr::root(), area, buf, tree, &self.selection);
     }
 }
 
-fn render_subtree(area: Rect, buf: &mut Buffer, tree: TreeSlice, selection: &[usize]) {
+fn render_subtree(
+    state: &mut AppState,
+    addr: &StackAddr,
+    area: Rect,
+    buf: &mut Buffer,
+    tree: TreeSlice,
+    selection: &[usize],
+) {
     if tree.is_empty() {
         return;
     }
 
-    // TODO: render with this if partition results in a small block
     // Can't display useful information if area is too small
     if tree.len() > 1 && (area.height < 2 || area.width <= 2) {
         let head = selection.first();
@@ -957,20 +1080,35 @@ fn render_subtree(area: Rect, buf: &mut Buffer, tree: TreeSlice, selection: &[us
             Fill::new(symbols::DOT).style(style).render(area, buf);
         }
 
+        let addr = addr.push(tree.first().unwrap().0);
+
+        if let Some(click) = &state.click_pos
+            && area.contains(*click)
+            && state.click_area.intersection(area) == area
+        {
+            state.click_area = area;
+            state.click_addr.clear();
+            for id in &addr {
+                state.click_addr.push(id)
+            }
+
+            state.click_addr.reverse();
+        }
+
         return;
     }
 
     if tree.len() == 1 {
         let (key, entry) = &tree[0];
 
-        render_entry(area, buf, *key, entry, selection);
+        render_entry(state, addr, area, buf, *key, entry, selection);
 
         return;
     }
 
     match partition(tree) {
         MaybePair::One(entries) => {
-            render_subtree(area, buf, entries, selection);
+            render_subtree(state, addr, area, buf, entries, selection);
             // Paragraph::new(format!("{entries:?}"))
             //     .centered()
             //     .render(area, buf);
@@ -1003,13 +1141,21 @@ fn render_subtree(area: Rect, buf: &mut Buffer, tree: TreeSlice, selection: &[us
                     .split(area);
             }
 
-            render_subtree(layout[0], buf, left, selection);
-            render_subtree(layout[1], buf, right, selection);
+            render_subtree(state, addr, layout[0], buf, left, selection);
+            render_subtree(state, addr, layout[1], buf, right, selection);
         }
     }
 }
 
-fn render_entry(area: Rect, buf: &mut Buffer, key: usize, entry: &Entry, selection: &[usize]) {
+fn render_entry(
+    state: &mut AppState,
+    addr: &StackAddr,
+    area: Rect,
+    buf: &mut Buffer,
+    key: usize,
+    entry: &Entry,
+    selection: &[usize],
+) {
     let Entry {
         path,
         size,
@@ -1018,8 +1164,22 @@ fn render_entry(area: Rect, buf: &mut Buffer, key: usize, entry: &Entry, selecti
         ..
     } = entry;
 
+    let addr = addr.push(key);
     let title = path.file_name().unwrap_or_default();
     let display = title.display();
+
+    if let Some(click) = &state.click_pos
+        && area.contains(*click)
+        && state.click_area.intersection(area) == area
+    {
+        state.click_area = area;
+        state.click_addr.clear();
+        for id in &addr {
+            state.click_addr.push(id)
+        }
+
+        state.click_addr.reverse();
+    }
 
     let (selected, selection) = if selection.first() == Some(&key) {
         (true, &selection[1..])
@@ -1034,6 +1194,9 @@ fn render_entry(area: Rect, buf: &mut Buffer, key: usize, entry: &Entry, selecti
         .border_style(style);
 
     if area.height > 1 {
+        // let mut a = addr.collect_vec();
+        // a.reverse();
+        // block = block.title_bottom(format!("{a:?}"));
         block = block.title_bottom(format_size(*size, DECIMAL));
     }
 
@@ -1051,6 +1214,24 @@ fn render_entry(area: Rect, buf: &mut Buffer, key: usize, entry: &Entry, selecti
             .style(style)
             .render(inner, buf);
     } else if inner.height > 2 || inner.width > 2 {
-        render_subtree(inner, buf, subtree, selection);
+        render_subtree(state, &addr, inner, buf, subtree, selection);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use itertools::Itertools as _;
+
+    use super::StackAddr;
+
+    #[test]
+    fn test_addr() {
+        let root = StackAddr(None);
+
+        let one = StackAddr(Some((1, &root)));
+        let two = one.push(2);
+
+        let all = (&two).collect_vec();
+        assert_eq!(all, vec![2, 1]);
     }
 }
