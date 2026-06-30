@@ -16,7 +16,7 @@ use humansize::{DECIMAL, format_size};
 use ignore::overrides::OverrideBuilder;
 use itertools::Itertools as _;
 use ratatui::layout::{Constraint, Direction, Layout, Position};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Modifier, Style, Stylize as _};
 use ratatui::symbols;
 use ratatui::text::{Line, Text, ToLine as _};
 use ratatui::widgets::{
@@ -128,6 +128,38 @@ pub fn tree_find_path(
     }
 
     None
+}
+
+fn prune_view(forest: &mut Vec<(usize, Entry)>, view_addr: &[usize]) -> Vec<(usize, Entry)> {
+    // Traverse twice instead of using a parent var to appease borrow checker
+    // Could also use an parent + Some(child_idx) to represent cursor, but that just makes
+    // the single traversal more complicated for little practical gain.
+    let mut addr = Vec::new();
+    let mut cursor = &*forest;
+    for id in view_addr {
+        if let Ok(idx) = cursor.binary_search_by_key(id, |(id, _)| *id) {
+            addr.push(idx);
+            cursor = &cursor[idx].1.subtree;
+        } else {
+            break;
+        }
+    }
+
+    // Second traversal to the parent Vec, then splice out the entry
+    // to ensure we don't leave dangling empty directories that will
+    // be confused as empty leaves.
+    if let Some(last_idx) = addr.pop() {
+        let mut cursor = forest;
+        for idx in addr {
+            cursor = &mut cursor[idx].1.subtree;
+        }
+
+        let (_, entry) = cursor.remove(last_idx);
+
+        entry.subtree
+    } else {
+        std::mem::take(forest)
+    }
 }
 
 #[derive(Default, Clone, Debug, Hash, Eq, PartialEq)]
@@ -372,12 +404,12 @@ fn walk_fs(args: &Args, state: Arc<Mutex<ScanState>>) -> Result<Forest> {
         }
     }
 
-    Ok(make_forest(args, leaves))
+    Ok(make_forest(args, &args.path, leaves))
 }
 
 // TODO: parallelize
-fn make_forest(args: &Args, leaves: Vec<Entry>) -> Vec<(usize, Entry)> {
-    let root = args.path.canonicalize().unwrap_or(args.path.clone());
+fn make_forest(args: &Args, root: impl AsRef<Path>, leaves: Vec<Entry>) -> Vec<(usize, Entry)> {
+    let root = root.as_ref().canonicalize().unwrap_or(args.path.clone());
     let (kidding, extensions) = rehash(args, leaves);
 
     let mut kidding = kidding;
@@ -541,7 +573,6 @@ fn main() -> Result<()> {
         args.include_gitexcluded = true;
     }
 
-    let target = args.path.clone();
     let scan_state = Arc::new(Mutex::new(ScanState::default()));
 
     let th = {
@@ -564,7 +595,7 @@ fn main() -> Result<()> {
         .join()
         .map_err(|_e| eyre::eyre!("Failed to spawn scanner"))??;
 
-    let mut app = App::new(args.clone(), &target, scanned);
+    let mut app = App::new(args.clone(), scanned);
 
     ratatui::run(|terminal| app.run(terminal))
 }
@@ -683,17 +714,28 @@ impl ScanUI {
 pub struct App {
     args: Args,
     exit: bool,
-    mode_switch: bool,
 
-    path: PathBuf,
     entries: TreeFocus,
+    reserve: Vec<Entry>,
 
     tree_items: Vec<TreeItem<'static, usize>>,
     selection: Vec<usize>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+enum AppMode {
+    #[default]
+    Normal,
+    Xray,
+    Scatter,
+}
+
 #[derive(Default)]
 pub struct AppState {
+    root: PathBuf,
+    mode: AppMode,
+    mode_switch: Option<AppMode>,
+
     title: Option<OsString>,
     skip_view: Vec<usize>,
     tree_state: TreeState<usize>,
@@ -705,7 +747,7 @@ pub struct AppState {
 }
 
 impl App {
-    pub fn new(args: Args, path: impl Into<PathBuf>, entries: Forest) -> Self {
+    pub fn new(args: Args, entries: Forest) -> Self {
         let tree_items = tree_items(entries.as_slice());
         let focus = TreeFocusBuilder {
             tree: entries.clone(),
@@ -716,9 +758,8 @@ impl App {
         Self {
             args,
             exit: false,
-            mode_switch: false,
-            path: path.into(),
             entries: focus,
+            reserve: Default::default(),
             tree_items,
             selection: Default::default(),
         }
@@ -730,21 +771,49 @@ impl App {
             .backend_mut()
             .execute(crossterm::event::EnableMouseCapture);
 
-        let mut state = AppState::default();
+        let mut state = AppState {
+            root: self.args.path.to_path_buf(),
+            ..AppState::default()
+        };
 
         while !self.exit {
-            if self.mode_switch {
-                self.mode_switch = false;
-
+            if let Some(mode) = state.mode_switch {
                 let restore_view = self.view_entry(&state).path;
-                let restore_path = self.entries.borrow_focus().map(|it| it.path.to_path_buf());
+                let restore_path = self.entries.borrow_focus().and_then(|it| {
+                    if it.is_group {
+                        it.path.parent().map(|p| p.to_path_buf())
+                    } else {
+                        Some(it.path.to_path_buf())
+                    }
+                });
                 let restore_tag = state.tag.clone();
 
-                self.args.xray = !self.args.xray;
                 let entries = std::mem::take(&mut self.entries);
-                let forest = entries.into_heads().tree;
-                let leaves = deforest(forest);
-                let tree = make_forest(&self.args, leaves);
+                let mut forest = entries.into_heads().tree;
+
+                let leaves = match mode {
+                    AppMode::Normal => {
+                        self.args.xray = false;
+                        self.reserve.extend_from_slice(&deforest(forest));
+                        state.root = self.args.path.clone();
+                        std::mem::take(&mut self.reserve)
+                    }
+                    AppMode::Xray => {
+                        self.args.xray = true;
+                        state.root = self.args.path.clone();
+                        deforest(forest)
+                    }
+                    AppMode::Scatter => {
+                        self.args.xray = true;
+                        let pruned = prune_view(&mut forest, state.skip_view.as_slice());
+                        self.reserve = deforest(forest);
+                        state.root = restore_view.clone();
+
+                        deforest(pruned)
+                    }
+                };
+
+                let tree = make_forest(&self.args, &state.root, leaves);
 
                 self.entries = TreeFocusBuilder {
                     tree,
@@ -755,10 +824,14 @@ impl App {
                 self.tree_items = tree_items(self.entries.borrow_tree());
 
                 self.selection = Default::default();
-                state = AppState {
-                    tag: restore_tag.clone(),
-                    ..Default::default()
-                };
+                state.tag = restore_tag.clone();
+                state.title = Some(restore_view.as_os_str().to_os_string());
+                state.mode = mode;
+                state.mode_switch = Default::default();
+                state.click_pos = Default::default();
+                state.click_addr = Default::default();
+                state.tree_state = Default::default();
+                state.skip_view = Default::default();
 
                 if let Some(addr) = tree_find_path(
                     self.entries.borrow_tree(),
@@ -789,6 +862,8 @@ impl App {
                     state.title = Some(entry.path.into_os_string());
                 } else if let Some(tag) = &entry.tag {
                     state.title = Some(entry.path.join("**").with_extension(tag).into_os_string());
+                } else {
+                    state.title = Some(state.root.as_os_str().into());
                 }
             }
 
@@ -822,7 +897,7 @@ impl App {
             if let Some(entry) = self.entries.borrow_focus() {
                 if let Some(tag) = &entry.tag {
                     state.tag = Some(tag.clone());
-                } else if entry.subtree.is_empty() {
+                } else if entry.subtree.is_empty() || entry.is_group {
                     state.tag = Some(entry.path.extension().unwrap_or_default().to_os_string());
                 }
             }
@@ -832,8 +907,11 @@ impl App {
     }
 
     fn draw(&self, frame: &mut Frame, state: &mut AppState) {
-        let area = frame.area();
+        let mut window = Block::bordered();
+        let area = window.inner(frame.area());
+
         state.click_area = area;
+
         let layout = Layout::default()
             .direction(Direction::Horizontal)
             .constraints(vec![Constraint::Max(50), Constraint::Fill(10)])
@@ -849,14 +927,65 @@ impl App {
             .split(layout[0]);
 
         let title = state.title.as_deref().unwrap_or_default().display();
+        window = window.title(title.to_line().centered());
+
+        let status_line = match state.mode {
+            AppMode::Normal => Line::from(vec![
+                " Mode: normal ".into(),
+                " | Keys: ".bold(),
+                " Focus ".into(),
+                "<Enter> ".blue().bold(),
+                " Defocus ".into(),
+                "<Back> ".blue().bold(),
+                " X-Ray mode ".into(),
+                "x ".blue().bold(),
+                " Scatter mode ".into(),
+                "X ".blue().bold(),
+                " Quit ".into(),
+                "q ".blue().bold(),
+            ]),
+
+            AppMode::Xray => Line::from(vec![
+                " Mode: x-ray ".into(),
+                " | Keys: ".bold(),
+                " Focus ".into(),
+                "<Enter> ".blue().bold(),
+                " Defocus ".into(),
+                "<Back> ".blue().bold(),
+                " Normal mode ".into(),
+                "x".blue().bold(),
+                "/".into(),
+                "X ".blue().bold(),
+                " Quit ".into(),
+                "q ".blue().bold(),
+            ]),
+            AppMode::Scatter => Line::from(vec![
+                " Mode: scatter ".into(),
+                " | Keys: ".bold(),
+                " Focus ".into(),
+                "<Enter> ".blue().bold(),
+                " Defocus ".into(),
+                "<Back> ".blue().bold(),
+                " Normal mode ".into(),
+                "x".blue().bold(),
+                "/".into(),
+                "X ".blue().bold(),
+                " Quit ".into(),
+                "q ".blue().bold(),
+            ]),
+        };
+
+        window = window.title_bottom(status_line.centered());
+
+        frame.render_widget(window, frame.area());
+
         let widget = Tree::new(&self.tree_items)
             .expect("all item identifiers are unique")
             .block(
                 Block::new()
-                    .borders(Borders::TOP | Borders::BOTTOM)
+                    .borders(Borders::BOTTOM)
                     .border_type(ratatui::widgets::BorderType::Double)
-                    .padding(Padding::proportional(1))
-                    .title(title.to_line().centered()),
+                    .padding(Padding::proportional(1)),
             )
             .experimental_scrollbar(Some(
                 Scrollbar::new(ScrollbarOrientation::VerticalRight)
@@ -926,8 +1055,18 @@ impl App {
     fn handle_key_event(&mut self, state: &mut AppState, key: KeyEvent) -> bool {
         match key.code {
             KeyCode::Char('q') => self.exit(),
+            KeyCode::Char('X') => {
+                state.mode_switch = Some(match state.mode {
+                    AppMode::Normal => AppMode::Scatter,
+                    _ => AppMode::Normal,
+                });
+                true
+            }
             KeyCode::Char('x') => {
-                self.mode_switch = true;
+                state.mode_switch = Some(match state.mode {
+                    AppMode::Normal => AppMode::Xray,
+                    _ => AppMode::Normal,
+                });
                 true
             }
             KeyCode::Char('\n' | ' ') => state.tree_state.toggle_selected(),
@@ -976,7 +1115,7 @@ impl App {
     fn view_entry(&self, state: &AppState) -> Entry {
         // A synthetic entry for the root
         let root = Entry {
-            path: self.path.clone(),
+            path: state.root.clone(),
             subtree: self.entries.borrow_tree().to_vec(),
             ..Default::default()
         };
