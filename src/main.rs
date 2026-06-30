@@ -32,9 +32,9 @@ use tui_tree_widget::{Scrollbar, Tree, TreeItem, TreeState};
 
 use clap::Parser;
 
-#[derive(Parser)]
+#[derive(Parser, Debug, Clone)]
 #[command(version, about, long_about = None)]
-struct Args {
+pub struct Args {
     /// Scanning root path
     #[arg(default_value = ".")]
     path: PathBuf,
@@ -71,26 +71,37 @@ struct Args {
     overrides: Vec<String>,
 }
 
-type DirTree = Vec<(usize, Entry)>;
+type Forest = Vec<(usize, Entry)>;
 type TreeSlice<'a> = &'a [(usize, Entry)];
+type LineageMap = HashMap<(PathBuf, OsString), HashSet<Entry>>;
 
 #[derive(Default, Clone, Debug, Hash, Eq, PartialEq)]
 pub struct Entry {
     path: PathBuf,
     tag: OsString,
     size: usize,
-    subtree: DirTree,
+    subtree: Forest,
     color: Color,
     is_group: bool,
 }
 
 #[ouroboros::self_referencing]
 pub struct TreeFocus {
-    tree: DirTree,
+    tree: Forest,
 
     #[borrows(tree)]
     #[covariant]
     focus: Option<&'this Entry>,
+}
+
+impl Default for TreeFocus {
+    fn default() -> Self {
+        TreeFocusBuilder {
+            tree: Default::default(),
+            focus_builder: |_| None,
+        }
+        .build()
+    }
 }
 
 impl TreeFocus {
@@ -126,7 +137,7 @@ fn scan_fs<P: AsRef<Path>>(
     state: Arc<Mutex<ScanState>>,
     path: P,
     make_groups: bool,
-) -> Result<DirTree> {
+) -> Result<Forest> {
     let mut entries = std::fs::read_dir(path)?
         .map_ok(|ent| -> Result<_> {
             {
@@ -256,10 +267,9 @@ fn cumsum_size(entries: Vec<Entry>) -> Vec<(usize, Entry)> {
         .collect()
 }
 
-fn walk_fs(args: &Args, state: Arc<Mutex<ScanState>>) -> Result<DirTree> {
+fn walk_fs(args: &Args, state: Arc<Mutex<ScanState>>) -> Result<Forest> {
     let root = args.path.canonicalize()?;
-    let mut kidding: HashMap<(PathBuf, OsString), HashSet<Entry>> = Default::default();
-    let mut extensions: HashSet<OsString> = Default::default();
+    let mut leaves: Vec<Entry> = Default::default();
 
     let mut overrides = OverrideBuilder::new(&root);
     for glob in &args.overrides {
@@ -293,50 +303,35 @@ fn walk_fs(args: &Args, state: Arc<Mutex<ScanState>>) -> Result<DirTree> {
                     continue;
                 }
 
-                let ext = if args.xray {
-                    ent.path().extension().unwrap_or_default()
-                } else {
-                    Default::default()
-                }
-                .to_os_string();
-
-                extensions.insert(ext.clone());
-
                 let color = file_color(ent.path());
-                let mut cursor = Entry {
+                let entry = Entry {
                     path: ent.path().into(),
                     size: metadata.len() as usize,
                     color,
-                    tag: ext.clone(),
                     ..Default::default()
                 };
 
-                while let Some(parent) = cursor.path.parent() {
-                    let parent = parent.to_path_buf();
-                    let siblings = kidding.entry((parent.clone(), ext.clone())).or_default();
-                    if siblings.contains(&cursor) {
-                        break;
-                    }
-
-                    siblings.insert(cursor);
-                    let color = dir_color(&parent);
-                    cursor = Entry {
-                        path: parent,
-                        color,
-                        tag: ext.clone(),
-                        ..Default::default()
-                    }
-                }
+                leaves.push(entry);
             }
             Err(err) => tracing::warn!("{}", err),
         }
     }
 
+    Ok(make_forest(args, leaves))
+}
+
+// TODO: parallelize
+fn make_forest(args: &Args, leaves: Vec<Entry>) -> Vec<(usize, Entry)> {
+    let root = args.path.canonicalize().unwrap_or(args.path.clone());
+    let (kidding, extensions) = rehash(args, leaves);
+
+    let mut kidding = kidding;
+
     if args.xray {
         let mut entries = extensions
             .iter()
             .map(|ext| {
-                let subtree = treeify(args, &mut kidding, (&root, ext));
+                let subtree = treeify(args, &mut kidding, &root, ext);
                 let size = if !subtree.is_empty() {
                     subtree.iter().map(|(_, it)| it.size).sum()
                 } else {
@@ -362,18 +357,70 @@ fn walk_fs(args: &Args, state: Arc<Mutex<ScanState>>) -> Result<DirTree> {
             })
             .collect_vec();
         entries.sort_by_key(|it| Reverse(it.size));
-        Ok(cumsum_size(entries))
+        cumsum_size(entries)
     } else {
-        Ok(treeify(args, &mut kidding, (&root, Default::default())))
+        treeify(args, &mut kidding, &root, Default::default())
     }
+}
+
+fn leaves(entry: Entry) -> Vec<Entry> {
+    if entry.subtree.is_empty() {
+        return vec![entry];
+    }
+
+    deforest(entry.subtree)
+}
+
+fn deforest(forest: Forest) -> Vec<Entry> {
+    forest
+        .into_iter()
+        .flat_map(|(_, it)| leaves(it))
+        .collect_vec()
+}
+
+fn rehash(args: &Args, leaves: Vec<Entry>) -> (LineageMap, HashSet<OsString>) {
+    let mut kidding: HashMap<(PathBuf, OsString), HashSet<Entry>> = Default::default();
+    let mut extensions: HashSet<OsString> = Default::default();
+
+    for entry in leaves {
+        let ext = if args.xray {
+            entry.path.extension().unwrap_or_default()
+        } else {
+            Default::default()
+        }
+        .to_os_string();
+
+        extensions.insert(ext.clone());
+
+        let mut cursor = entry;
+
+        while let Some(parent) = cursor.path.parent() {
+            let parent = parent.to_path_buf();
+            let siblings = kidding.entry((parent.clone(), ext.clone())).or_default();
+            if siblings.contains(&cursor) {
+                break;
+            }
+
+            siblings.insert(cursor);
+            let color = dir_color(&parent);
+            cursor = Entry {
+                path: parent,
+                color,
+                tag: ext.clone(),
+                ..Default::default()
+            }
+        }
+    }
+    (kidding, extensions)
 }
 
 fn treeify(
     args: &Args,
     kidding: &mut HashMap<(PathBuf, OsString), HashSet<Entry>>,
-    path: (&Path, &OsStr),
-) -> DirTree {
-    let key = (path.0.to_path_buf(), path.1.to_os_string());
+    path: &Path,
+    ext: &OsStr,
+) -> Forest {
+    let key = (path.to_path_buf(), ext.to_os_string());
     let Some(entries) = kidding.remove(&key) else {
         return Default::default();
     };
@@ -381,21 +428,19 @@ fn treeify(
     let mut entries = entries
         .into_iter()
         .map(|mut it| {
-            let subtree = treeify(args, kidding, (&it.path, path.1));
+            let subtree = treeify(args, kidding, &it.path, ext);
             if !subtree.is_empty() {
                 it.size = subtree.iter().map(|(_, it)| it.size).sum();
                 it.subtree = subtree;
             }
-            // else {
-            //     it.path = it.path.join(format!("**.{}", path.1.display()));
-            // }
+
             it
         })
         .collect_vec();
 
     entries.sort_by_key(|it| Reverse(it.size));
 
-    if args.group {
+    if !args.xray && args.group {
         entries = regroup(entries);
     }
 
@@ -436,9 +481,6 @@ fn main() -> Result<()> {
     color_eyre::install()?;
 
     let mut args = Args::parse();
-    if args.xray {
-        args.group = false;
-    }
 
     if args.include_all {
         args.include_hidden = true;
@@ -452,6 +494,7 @@ fn main() -> Result<()> {
 
     let th = {
         let state = scan_state.clone();
+        let args = args.clone();
         std::thread::spawn(move || {
             let result = walk_fs(&args, state.clone());
             let mut state = state.lock().unwrap();
@@ -469,7 +512,9 @@ fn main() -> Result<()> {
         .join()
         .map_err(|_e| eyre::eyre!("Failed to spawn scanner"))??;
 
-    ratatui::run(|terminal| App::new(&target, scanned).run(terminal))
+    let mut app = App::new(args.clone(), &target, scanned);
+
+    ratatui::run(|terminal| app.run(terminal))
 }
 
 fn partition(whole: TreeSlice) -> MaybePair<TreeSlice> {
@@ -584,7 +629,10 @@ impl ScanUI {
 }
 
 pub struct App {
+    args: Args,
     exit: bool,
+    mode_switch: bool,
+
     path: PathBuf,
     title: Option<OsString>,
     entries: TreeFocus,
@@ -596,19 +644,22 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(path: impl Into<PathBuf>, entries: DirTree) -> Self {
+    pub fn new(args: Args, path: impl Into<PathBuf>, entries: Forest) -> Self {
         let tree_items = tree_items(entries.as_slice());
         let focus = TreeFocusBuilder {
             tree: entries.clone(),
             focus_builder: |_| None,
         }
         .build();
+
         Self {
+            args,
+            exit: false,
+            mode_switch: false,
             path: path.into(),
             title: None,
             entries: focus,
             tree_items,
-            exit: false,
             state: Default::default(),
             selection: Default::default(),
             skip_view: Default::default(),
@@ -622,6 +673,29 @@ impl App {
             .execute(crossterm::event::EnableMouseCapture);
 
         while !self.exit {
+            if self.mode_switch {
+                self.mode_switch = false;
+
+                self.args.xray = !self.args.xray;
+                let entries = std::mem::take(&mut self.entries);
+                let forest = entries.into_heads().tree;
+                let leaves = deforest(forest);
+                let tree = make_forest(&self.args, leaves);
+
+                self.entries = TreeFocusBuilder {
+                    tree,
+                    focus_builder: |_| None,
+                }
+                .build();
+
+                self.tree_items = tree_items(self.entries.borrow_tree());
+
+                self.title = Default::default();
+                self.state = Default::default();
+                self.selection = Default::default();
+                self.skip_view = Default::default();
+            }
+
             if self.title.is_none() {
                 let entry = self.view_entry();
                 if entry.tag.is_empty() {
@@ -739,6 +813,10 @@ impl App {
     fn handle_key_event(&mut self, key: KeyEvent) -> bool {
         match key.code {
             KeyCode::Char('q') => self.exit(),
+            KeyCode::Char('x') => {
+                self.mode_switch = true;
+                true
+            }
             KeyCode::Char('\n' | ' ') => self.state.toggle_selected(),
             KeyCode::Left => self.state.key_left(),
             KeyCode::Right => self.state.key_right(),
