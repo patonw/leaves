@@ -1,24 +1,25 @@
 use std::cmp::Reverse;
-use std::collections::{HashMap, HashSet};
-use std::convert::identity;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use color_eyre::Result;
 use crossterm::ExecutableCommand as _;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, MouseEventKind, poll};
+use either::Either;
 use eyre::Context as _;
 use humansize::{DECIMAL, format_size};
+use ignore::WalkState;
 use ignore::overrides::OverrideBuilder;
 use itertools::Itertools as _;
 use ratatui::layout::{Constraint, Direction, Layout, Position};
 use ratatui::style::{Color, Modifier, Style, Stylize as _};
 use ratatui::symbols;
-use ratatui::text::{Line, Text, ToLine as _};
+use ratatui::text::{Line, Text, ToLine as _, ToSpan};
 use ratatui::widgets::{
     Borders, Fill, Padding, Paragraph, ScrollbarOrientation, StatefulWidget, Wrap,
 };
@@ -29,10 +30,13 @@ use ratatui::{
     widgets::{Block, Widget},
 };
 
+use thousands::Separable;
 use tracing::instrument;
 use tui_tree_widget::{Scrollbar, Tree, TreeItem, TreeState};
 
 use clap::Parser;
+
+const ENTRY_CHUNK_SIZE: usize = 5000;
 
 #[derive(Parser, Debug, Clone)]
 #[command(version, about, long_about = None)]
@@ -167,9 +171,38 @@ pub struct Entry {
     path: PathBuf,
     tag: Option<OsString>,
     size: usize,
+    nfiles: usize,
     subtree: Forest,
     color: Color,
     is_group: bool,
+}
+
+// TODO: consolidation/composition
+#[derive(Default, Clone, Debug, Hash, Eq, PartialEq)]
+pub struct EntryInfo {
+    path: PathBuf,
+    tag: Option<OsString>,
+    size: usize,
+    nfiles: usize,
+}
+
+impl From<&Entry> for EntryInfo {
+    fn from(value: &Entry) -> Self {
+        let Entry {
+            path,
+            tag,
+            size,
+            nfiles,
+            ..
+        } = value;
+
+        Self {
+            path: path.clone(),
+            tag: tag.clone(),
+            size: *size,
+            nfiles: *nfiles,
+        }
+    }
 }
 
 #[ouroboros::self_referencing]
@@ -219,71 +252,6 @@ impl<P: AsRef<Path>> From<(P, usize)> for Entry {
     }
 }
 
-#[allow(unused)]
-fn scan_fs<P: AsRef<Path>>(
-    state: Arc<Mutex<ScanState>>,
-    path: P,
-    make_groups: bool,
-) -> Result<Forest> {
-    let mut entries = std::fs::read_dir(path)?
-        .map_ok(|ent| -> Result<_> {
-            {
-                let mut state = state.lock().unwrap();
-                state.count += 1;
-                state.path = ent.path();
-            }
-
-            let metadata = ent.metadata()?;
-            if metadata.is_dir() {
-                let subtree = scan_fs(state.clone(), ent.path(), make_groups)?;
-                let range = key_range(subtree.as_slice()).unwrap_or_default();
-                let size = range.len();
-
-                let color = dir_color(ent.path());
-
-                if size > 0 {
-                    Ok(Some(Entry {
-                        path: ent.path(),
-                        size,
-                        subtree,
-                        color,
-                        ..Default::default()
-                    }))
-                } else {
-                    Ok(None)
-                }
-            } else if metadata.is_file() && metadata.len() > 0 {
-                let color = file_color(ent.path());
-                {
-                    let mut state = state.lock().unwrap();
-                    state.total += metadata.len() as usize;
-                }
-
-                Ok(Some(Entry {
-                    path: ent.path(),
-                    size: metadata.len() as usize,
-                    color,
-                    ..Default::default()
-                }))
-            } else {
-                // TODO: deal with hard links possibly at different levels
-                // Ignore symlinks
-                Ok(None)
-            }
-        })
-        .flatten()
-        .filter_map_ok(identity)
-        .collect::<Result<Vec<_>>>()?;
-
-    entries.sort_by_key(|it| Reverse(it.size));
-
-    if make_groups {
-        entries = regroup(entries);
-    }
-
-    Ok(cumsum_size(entries))
-}
-
 fn dir_color(dir_path: impl AsRef<Path>) -> Color {
     let mut h = DefaultHasher::default();
     format!(
@@ -324,12 +292,14 @@ fn regroup(entries: Vec<Entry>) -> Vec<Entry> {
             } else {
                 let label = format!("*.{}", k.display());
                 let size = v.iter().map(|it| it.size).sum();
+                let count = v.iter().map(|it| it.nfiles).sum();
                 let color = v[0].color;
                 let subtree = cumsum_size(v);
 
                 Entry {
                     path: label.into(),
                     size,
+                    nfiles: count,
                     subtree,
                     color,
                     is_group: true,
@@ -355,8 +325,9 @@ fn cumsum_size(entries: Vec<Entry>) -> Vec<(usize, Entry)> {
 }
 
 fn walk_fs(args: &Args, state: Arc<Mutex<ScanState>>) -> Result<Forest> {
+    let (tx, rx) = mpsc::channel();
     let root = args.path.canonicalize()?;
-    let mut leaves: Vec<Entry> = Default::default();
+    // let mut leaves: Vec<Entry> = Default::default();
 
     let mut overrides = OverrideBuilder::new(&root);
     for glob in &args.overrides {
@@ -369,46 +340,181 @@ fn walk_fs(args: &Args, state: Arc<Mutex<ScanState>>) -> Result<Forest> {
         .ignore(!args.include_ignored)
         .git_ignore(!args.include_gitignored)
         .git_exclude(!args.include_gitexcluded)
-        .build();
+        .build_parallel();
 
-    for result in walker {
-        // Each item yielded by the iterator is either a directory entry or an
-        // error, so either print the path or the error.
-        match result {
-            Ok(ent) => {
-                {
-                    let mut state = state.lock().unwrap();
-                    state.count += 1;
-                    state.path = ent.path().into();
+    walker.run(move || {
+        let tx = tx.clone();
+        // TODO: lock-free scan state
+        let state = state.clone();
+
+        Box::new(move |result| {
+            match result {
+                Ok(ent) => {
+                    {
+                        let mut state = state.lock().unwrap();
+                        state.count += 1;
+                        state.path = ent.path().into();
+                    }
+
+                    let Ok(metadata) = ent.metadata() else {
+                        return WalkState::Continue;
+                    };
+                    if metadata.is_file() && metadata.len() > 0 {
+                        let mut state = state.lock().unwrap();
+                        state.total += metadata.len() as usize;
+                    } else {
+                        return WalkState::Continue;
+                    }
+
+                    let color = file_color(ent.path());
+                    let entry = Entry {
+                        path: ent.path().into(),
+                        size: metadata.len() as usize,
+                        nfiles: 1,
+                        color,
+                        ..Default::default()
+                    };
+
+                    if tx.send(entry).is_err() {
+                        return WalkState::Quit;
+                    }
                 }
-
-                let metadata = ent.metadata()?;
-                if metadata.is_file() && metadata.len() > 0 {
-                    let mut state = state.lock().unwrap();
-                    state.total += metadata.len() as usize;
-                } else {
-                    continue;
-                }
-
-                let color = file_color(ent.path());
-                let entry = Entry {
-                    path: ent.path().into(),
-                    size: metadata.len() as usize,
-                    color,
-                    ..Default::default()
-                };
-
-                leaves.push(entry);
+                Err(err) => tracing::warn!("{}", err),
             }
-            Err(err) => tracing::warn!("{}", err),
-        }
-    }
+            WalkState::Continue
+        })
+    });
 
-    Ok(make_forest(args, &args.path, leaves))
+    Ok(par_forest(args, &args.path, rx, None))
 }
 
-// TODO: parallelize
-fn make_forest(args: &Args, root: impl AsRef<Path>, leaves: Vec<Entry>) -> Vec<(usize, Entry)> {
+// Creates forests from leaves in chunks, then merges the results.
+fn _par_forest(
+    args: &Args,
+    root: impl AsRef<Path>,
+    leaves: impl IntoIterator<Item = Entry>,
+    _num_workers: Option<usize>,
+) -> Vec<(usize, Entry)> {
+    use itertools::Itertools as _;
+    use rayon::prelude::*;
+
+    let root = root.as_ref().canonicalize().unwrap_or(args.path.clone());
+
+    // path-based chunking might make for quicker merges... maybe
+    let chunks = leaves
+        .into_iter()
+        .chunks(50_000)
+        .into_iter()
+        .map(|chunk| chunk.collect_vec())
+        .collect_vec();
+
+    chunks
+        .into_par_iter()
+        .map({
+            let args = args.clone();
+            let root = root.clone();
+
+            move |chunk| make_forest(&args, &root, chunk)
+        })
+        .reduce(Vec::new, merge_forests)
+}
+
+fn par_forest(
+    args: &Args,
+    root: impl AsRef<Path>,
+    leaves: impl IntoIterator<Item = Entry>,
+    est_count: Option<usize>,
+) -> Vec<(usize, Entry)> {
+    use crossbeam_channel::unbounded;
+    use itertools::Itertools as _;
+    use std::thread;
+
+    let root = root.as_ref().canonicalize().unwrap_or(args.path.clone());
+
+    let num_workers = est_count.map(|c| c / ENTRY_CHUNK_SIZE / 10);
+    let num_cores = thread::available_parallelism()
+        .map(|c| c.get())
+        .unwrap_or(1);
+
+    let num_threads = num_workers.map(|x| x.min(num_cores)).unwrap_or(num_cores);
+
+    if num_threads <= 1 {
+        return make_forest(args, root, leaves);
+    }
+
+    thread::scope(|ts| {
+        let (tx, rx) = unbounded::<Vec<Entry>>();
+
+        // Create forests in parallel from chunks of entries.
+        // Use chunking to reduce overhead from channel
+        let mut handles = (0..num_threads)
+            .map(|_| {
+                ts.spawn({
+                    let args = args.clone();
+                    let root = root.clone();
+                    let rx = rx.clone();
+                    move || make_forest(&args, &root, rx.into_iter().flatten())
+                })
+            })
+            .map(Either::Left)
+            .collect_vec();
+
+        drop(rx);
+
+        for it in leaves.into_iter().chunks(ENTRY_CHUNK_SIZE).into_iter() {
+            // hmmm, how to reduce allocations here?
+            if tx.send(it.collect_vec()).is_err() {
+                break;
+            }
+        }
+
+        drop(tx);
+
+        // Reduction loop to a single forest
+        loop {
+            let mut results = handles
+                .into_iter()
+                .map(|h| match h {
+                    Either::Left(h) => h.join().expect("Couldn't join threads"),
+                    Either::Right(v) => v,
+                })
+                .collect_vec();
+
+            if results.len() <= 1 {
+                let Some(result) = results.pop() else {
+                    return Vec::default();
+                };
+
+                return result;
+            }
+
+            handles = results
+                .into_iter()
+                .chunks(2)
+                .into_iter()
+                .map(|mut chunk| {
+                    let Some(left) = chunk.next() else {
+                        return Either::Right(Vec::new());
+                    };
+
+                    let Some(right) = chunk.next() else {
+                        return Either::Right(left);
+                    };
+
+                    Either::Left(ts.spawn(|| merge_forests(left, right)))
+                })
+                .collect_vec();
+        }
+    })
+}
+
+// Move entries instead of slicing to reduce allocations. Still need to allocate for interior
+// nodes, but should be an order of magnitude less.
+fn make_forest(
+    args: &Args,
+    root: impl AsRef<Path>,
+    leaves: impl IntoIterator<Item = Entry>,
+) -> Vec<(usize, Entry)> {
     let root = root.as_ref().canonicalize().unwrap_or(args.path.clone());
     let (kidding, extensions) = rehash(args, leaves);
 
@@ -419,11 +525,8 @@ fn make_forest(args: &Args, root: impl AsRef<Path>, leaves: Vec<Entry>) -> Vec<(
             .iter()
             .map(|ext| {
                 let subtree = treeify(args, &mut kidding, &root, &Some(ext.clone()));
-                let size = if !subtree.is_empty() {
-                    subtree.iter().map(|(_, it)| it.size).sum()
-                } else {
-                    0
-                };
+                let size = subtree.iter().map(|(_, it)| it.size).sum();
+                let nfiles = subtree.iter().map(|(_, it)| it.nfiles).sum();
 
                 let label = if ext.is_empty() {
                     "(none)".into()
@@ -436,6 +539,7 @@ fn make_forest(args: &Args, root: impl AsRef<Path>, leaves: Vec<Entry>) -> Vec<(
                 Entry {
                     path,
                     size,
+                    nfiles,
                     subtree,
                     color,
                     is_group: true,
@@ -450,22 +554,88 @@ fn make_forest(args: &Args, root: impl AsRef<Path>, leaves: Vec<Entry>) -> Vec<(
     }
 }
 
-fn leaves(entry: Entry) -> Vec<Entry> {
-    if entry.subtree.is_empty() {
-        return vec![entry];
+pub struct LeafIterator {
+    entries: VecDeque<Entry>,
+}
+
+impl Iterator for LeafIterator {
+    type Item = Entry;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some(entry) = self.entries.pop_front() {
+            if entry.subtree.is_empty() {
+                return Some(entry);
+            }
+
+            for (_, it) in entry.subtree {
+                self.entries.push_front(it);
+            }
+        }
+
+        None
+    }
+}
+
+pub fn into_leaves(entries: impl Iterator<Item = Entry>) -> LeafIterator {
+    let entries = entries.into_iter().collect();
+    LeafIterator { entries }
+}
+
+fn deforest(forest: Forest) -> LeafIterator {
+    into_leaves(forest.into_iter().map(|(_, it)| it))
+}
+
+/// Combine subtrees of two entries with the same path & tag
+fn merge_entries(mut left: Entry, right: Entry) -> Entry {
+    assert_eq!(left.path, right.path);
+    assert_eq!(left.tag, right.tag);
+
+    left.subtree = merge_forests(left.subtree, right.subtree);
+    left.size += right.size;
+    left.nfiles += right.nfiles;
+
+    left
+}
+
+fn merge_forests(left: Forest, right: Forest) -> Vec<(usize, Entry)> {
+    let queue = left.into_iter().chain(right).map(|(_, it)| it);
+    // .sorted_by_key(|it| (it.path.to_path_buf(), it.tag.clone()))
+    // .collect();
+
+    // let mut combined: Vec<Entry> = vec![];
+    //
+    // if let Some(first) = queue.pop_front() {
+    //     combined.push(first);
+    // }
+    //
+    // while let Some(cursor) = combined.pop()
+    //     && let Some(other) = queue.pop_front()
+    // {
+    //     if cursor.path == other.path && cursor.tag == other.tag {
+    //         combined.push(merge_entries(cursor, other));
+    //     } else {
+    //         combined.push(cursor);
+    //         combined.push(other);
+    //     }
+    // }
+
+    let mut crash = HashMap::new();
+
+    for it in queue {
+        let key = (it.path.clone(), it.tag.clone());
+        if let Some(other) = crash.remove(&key) {
+            crash.insert(key, merge_entries(other, it));
+        } else {
+            crash.insert(key, it);
+        }
     }
 
-    deforest(entry.subtree)
+    let mut combined = crash.into_values().collect_vec();
+    combined.sort_by_key(|it| Reverse(it.size));
+    cumsum_size(combined)
 }
 
-fn deforest(forest: Forest) -> Vec<Entry> {
-    forest
-        .into_iter()
-        .flat_map(|(_, it)| leaves(it))
-        .collect_vec()
-}
-
-fn rehash(args: &Args, leaves: Vec<Entry>) -> (LineageMap, HashSet<OsString>) {
+fn rehash(args: &Args, leaves: impl IntoIterator<Item = Entry>) -> (LineageMap, HashSet<OsString>) {
     let mut kidding: LineageMap = Default::default();
     let mut extensions: HashSet<OsString> = Default::default();
 
@@ -514,7 +684,12 @@ fn treeify(args: &Args, kidding: &mut LineageMap, path: &Path, ext: &Option<OsSt
         .map(|mut it| {
             let subtree = treeify(args, kidding, &it.path, ext);
             if !subtree.is_empty() {
-                it.size = subtree.iter().map(|(_, it)| it.size).sum();
+                if it.size == 0 {
+                    it.size = subtree.iter().map(|(_, it)| it.size).sum();
+                }
+                if it.nfiles == 0 {
+                    it.nfiles = subtree.iter().map(|(_, it)| it.nfiles).sum();
+                }
                 it.subtree = subtree;
             }
 
@@ -676,9 +851,6 @@ impl ScanUI {
     }
 
     fn draw(&self, frame: &mut Frame, state: ScanState) {
-        let area = frame.area();
-        let buf = frame.buffer_mut();
-
         let lines = vec![
             format!("Scanning {}", state.path.display()),
             format!("Count: {}", state.count),
@@ -688,7 +860,15 @@ impl ScanUI {
         .map(Line::from)
         .collect_vec();
         let text = Text::from(lines);
-        Paragraph::new(text).render(area, buf);
+        let area = frame.area().centered(
+            Constraint::Percentage(90),
+            Constraint::Length(4 + text.height() as u16),
+        );
+
+        frame.render_widget(
+            Paragraph::new(text).block(Block::bordered().padding(1.into())),
+            area,
+        );
     }
 
     fn handle_events(&mut self) -> Result<()> {
@@ -735,7 +915,9 @@ pub struct AppState {
     root: PathBuf,
     mode: AppMode,
     mode_switch: Option<AppMode>,
+    diagnostic: bool,
 
+    view_info: Option<EntryInfo>,
     title: Option<OsString>,
     skip_view: Vec<usize>,
     tree_state: TreeState<usize>,
@@ -748,7 +930,7 @@ pub struct AppState {
 
 impl App {
     pub fn new(args: Args, entries: Forest) -> Self {
-        let tree_items = tree_items(entries.as_slice());
+        let tree_items = par_tree_items(entries.as_slice());
         let focus = TreeFocusBuilder {
             tree: entries.clone(),
             focus_builder: |_| None,
@@ -771,14 +953,22 @@ impl App {
             .backend_mut()
             .execute(crossterm::event::EnableMouseCapture);
 
+        let mode = if self.args.xray {
+            AppMode::Xray
+        } else {
+            AppMode::Normal
+        };
+
         let mut state = AppState {
             root: self.args.path.to_path_buf(),
+            mode,
             ..AppState::default()
         };
 
         while !self.exit {
             if let Some(mode) = state.mode_switch {
-                let restore_view = self.view_entry(&state).path;
+                let restore_info = self.view_info(&state);
+                let restore_view = restore_info.path.as_path();
                 let restore_path = self.entries.borrow_focus().and_then(|it| {
                     if it.is_group {
                         it.path.parent().map(|p| p.to_path_buf())
@@ -791,29 +981,45 @@ impl App {
                 let entries = std::mem::take(&mut self.entries);
                 let mut forest = entries.into_heads().tree;
 
-                let leaves = match mode {
+                let (leaves, count) = match mode {
                     AppMode::Normal => {
                         self.args.xray = false;
-                        self.reserve.extend_from_slice(&deforest(forest));
+                        self.reserve
+                            .extend_from_slice(&deforest(forest).collect_vec());
                         state.root = self.args.path.clone();
-                        std::mem::take(&mut self.reserve)
+                        let items = std::mem::take(&mut self.reserve);
+                        let count = items.len();
+                        (Either::Left(items.into_iter()), Some(count))
                     }
                     AppMode::Xray => {
                         self.args.xray = true;
                         state.root = self.args.path.clone();
-                        deforest(forest)
+                        let count = key_range(self.entries.borrow_tree()).map(|r| r.end);
+                        (Either::Right(deforest(forest)), count)
                     }
                     AppMode::Scatter => {
                         self.args.xray = true;
-                        let pruned = prune_view(&mut forest, state.skip_view.as_slice());
-                        self.reserve = deforest(forest);
-                        state.root = restore_view.clone();
 
-                        deforest(pruned)
+                        let count = state.view_info.as_ref().map(|it| it.nfiles);
+                        let pruned = prune_view(&mut forest, state.skip_view.as_slice());
+                        self.reserve = deforest(forest).collect_vec();
+                        state.root = restore_view.to_path_buf();
+
+                        (Either::Right(deforest(pruned)), count)
                     }
                 };
 
-                let tree = make_forest(&self.args, &state.root, leaves);
+                // TODO: just create a new UI for this with a proper progress bar
+                terminal.draw(|frame| {
+                    let text = Text::raw("Recalculating. Please hold...");
+                    let area = frame.area().centered(
+                        Constraint::Length(text.width() as u16),
+                        Constraint::Length(1),
+                    );
+                    frame.render_widget(text, area);
+                })?;
+
+                let tree = par_forest(&self.args, &state.root, leaves, count);
 
                 self.entries = TreeFocusBuilder {
                     tree,
@@ -821,7 +1027,7 @@ impl App {
                 }
                 .build();
 
-                self.tree_items = tree_items(self.entries.borrow_tree());
+                self.tree_items = par_tree_items(self.entries.borrow_tree());
 
                 self.selection = Default::default();
                 state.tag = restore_tag.clone();
@@ -835,7 +1041,7 @@ impl App {
 
                 if let Some(addr) = tree_find_path(
                     self.entries.borrow_tree(),
-                    &restore_view,
+                    restore_view,
                     restore_tag.as_deref(),
                     &StackAddr::root(),
                 ) {
@@ -856,15 +1062,12 @@ impl App {
                 self.sync_view(&mut state);
             }
 
-            if state.title.is_none() {
-                let entry = self.view_entry(&state);
-                if entry.tag.is_none() {
-                    state.title = Some(entry.path.into_os_string());
-                } else if let Some(tag) = &entry.tag {
-                    state.title = Some(entry.path.join("**").with_extension(tag).into_os_string());
-                } else {
-                    state.title = Some(state.root.as_os_str().into());
-                }
+            if state.view_info.is_none() {
+                let info = self.view_info(&state);
+
+                let title = get_title(&state, &info);
+                state.title = Some(title);
+                state.view_info = Some(info);
             }
 
             if !state.click_addr.is_empty() {
@@ -921,59 +1124,84 @@ impl App {
             .direction(Direction::Vertical)
             .constraints(vec![
                 Constraint::Fill(10),
-                Constraint::Length(3),
+                // Constraint::Length(3),
                 Constraint::Percentage(25),
             ])
             .split(layout[0]);
 
-        let title = state.title.as_deref().unwrap_or_default().display();
-        window = window.title(title.to_line().centered());
+        let mut title = vec![];
+        if let Some(info) = &state.view_info {
+            if let Ok(rel_path) = info.path.strip_prefix(&state.root) {
+                // TODO: avoid converting to C-string
+                let root = format!("{}", state.root.display());
+                title.push(root.bold());
+                if !rel_path.as_os_str().is_empty() {
+                    let rel_path = format!("/{}", rel_path.display());
+                    title.push(rel_path.into())
+                }
+            } else {
+                title.push(format!("{}", info.path.display()).into())
+            }
 
-        let status_line = match state.mode {
+            if let Some(tag) = &info.tag {
+                title.push("/**.".into());
+                if tag.is_empty() {
+                    title.push("(none)".green().bold())
+                } else {
+                    title.push(format!("{}", tag.display()).green().bold())
+                }
+            }
+
+            title.push(" | ".into());
+            title.push(format_size(info.size, DECIMAL).bold());
+            title.push(format!(" ({} files)", info.nfiles.separate_with_commas()).into());
+        } else {
+            title.push("leaves".cyan().bold())
+        }
+
+        let title_text = Line::from(title);
+        window = window.title(title_text.centered());
+
+        let mut status_line = match state.mode {
             AppMode::Normal => Line::from(vec![
                 " Mode: normal ".into(),
                 " | Keys: ".bold(),
-                " Focus ".into(),
-                "<Enter> ".blue().bold(),
-                " Defocus ".into(),
-                "<Back> ".blue().bold(),
                 " X-Ray mode ".into(),
                 "x ".blue().bold(),
                 " Scatter mode ".into(),
                 "X ".blue().bold(),
-                " Quit ".into(),
-                "q ".blue().bold(),
             ]),
 
             AppMode::Xray => Line::from(vec![
                 " Mode: x-ray ".into(),
                 " | Keys: ".bold(),
-                " Focus ".into(),
-                "<Enter> ".blue().bold(),
-                " Defocus ".into(),
-                "<Back> ".blue().bold(),
                 " Normal mode ".into(),
                 "x".blue().bold(),
                 "/".into(),
                 "X ".blue().bold(),
-                " Quit ".into(),
-                "q ".blue().bold(),
             ]),
             AppMode::Scatter => Line::from(vec![
                 " Mode: scatter ".into(),
                 " | Keys: ".bold(),
-                " Focus ".into(),
-                "<Enter> ".blue().bold(),
-                " Defocus ".into(),
-                "<Back> ".blue().bold(),
                 " Normal mode ".into(),
                 "x".blue().bold(),
                 "/".into(),
                 "X ".blue().bold(),
-                " Quit ".into(),
-                "q ".blue().bold(),
             ]),
         };
+
+        if !state.tree_state.selected().is_empty() {
+            status_line.push_span(" Focus ".to_span());
+            status_line.push_span("<Enter> ".blue().bold());
+        }
+
+        if !state.skip_view.is_empty() {
+            status_line.push_span(" Defocus ".to_span());
+            status_line.push_span("<Back> ".blue().bold());
+        }
+
+        status_line.push_span(" Quit ".to_span());
+        status_line.push_span("q ".blue().bold());
 
         window = window.title_bottom(status_line.centered());
 
@@ -1003,28 +1231,51 @@ impl App {
 
         frame.render_stateful_widget(widget, sidebar[0], &mut state.tree_state);
 
-        let text = vec![
-            format!("{:?}", &state.skip_view),
-            format!("{:?}", state.tree_state.selected()),
-            format!("active tag: {:?}", &state.tag),
-        ];
-        let text = Text::from(text.into_iter().map(Line::from).collect_vec());
-        frame.render_widget(Paragraph::new(text), sidebar[1]);
+        let mut text = vec![];
+        if state.diagnostic {
+            text.extend_from_slice(&[
+                "--- Diagnostics ---".into(),
+                format!("VW {:?}", &state.skip_view),
+                format!("SL {:?}", state.tree_state.selected()),
+                format!("TG {:?}", &state.tag),
+                "".into(),
+                "--- File info ---".into(),
+            ]);
+        }
 
         if let Some(entry) = self.entries.borrow_focus() {
-            let text = vec![
+            text.extend_from_slice(&[
                 format!("{}", entry.path.display()),
-                format!("entry tag: {:?}", &entry.tag),
-            ];
-            let text = Text::from(text.into_iter().map(Line::from).collect_vec());
+                "".into(),
+                format!(
+                    "tag: {}",
+                    entry
+                        .tag
+                        .as_deref()
+                        .or_else(|| entry.path.extension())
+                        .unwrap_or(OsStr::new("(none)"))
+                        .display()
+                ),
+            ]);
 
-            frame.render_widget(
-                Paragraph::new(text)
-                    .block(Block::new().padding(Padding::proportional(1)))
-                    .wrap(Wrap { trim: false }),
-                sidebar[2],
-            );
+            if entry.nfiles > 1 {
+                // is dir
+                text.push(format!("files: {}", &entry.nfiles.separate_with_commas()));
+            } else {
+                // is file
+                text.push(format!("bytes: {}", &entry.size.separate_with_commas()));
+            }
         }
+
+        let text = Text::from(text.into_iter().map(Line::from).collect_vec());
+
+        frame.render_widget(
+            Paragraph::new(text)
+                .block(Block::new().padding(Padding::proportional(1)))
+                .wrap(Wrap { trim: false }),
+            sidebar[1],
+        );
+
         frame.render_stateful_widget(self, layout[1], state);
     }
 
@@ -1055,6 +1306,10 @@ impl App {
     fn handle_key_event(&mut self, state: &mut AppState, key: KeyEvent) -> bool {
         match key.code {
             KeyCode::Char('q') => self.exit(),
+            KeyCode::Char('i') => {
+                state.diagnostic = !state.diagnostic;
+                true
+            }
             KeyCode::Char('X') => {
                 state.mode_switch = Some(match state.mode {
                     AppMode::Normal => AppMode::Scatter,
@@ -1070,6 +1325,7 @@ impl App {
                 true
             }
             KeyCode::Char('\n' | ' ') => state.tree_state.toggle_selected(),
+            KeyCode::Char('<') => state.tree_state.close_all(),
             KeyCode::Left => state.tree_state.key_left(),
             KeyCode::Right => state.tree_state.key_right(),
             KeyCode::Down => state.tree_state.key_down(),
@@ -1099,11 +1355,20 @@ impl App {
     }
 
     fn sync_view(&mut self, state: &mut AppState) {
-        self.tree_items = tree_items(self.get_view(state));
+        while let Some(entry) = get_selection(&state.skip_view, self.entries.borrow_tree())
+            && entry.subtree.is_empty()
+        {
+            state.skip_view.pop();
+        }
+
+        self.tree_items = par_tree_items(self.get_view(state));
         state.tree_state.select(self.selection.clone());
+
         for i in 0..self.selection.len() {
             state.tree_state.open(self.selection[..i].to_vec());
         }
+
+        state.view_info = None;
         state.title = None;
     }
 
@@ -1112,22 +1377,32 @@ impl App {
         false
     }
 
-    fn view_entry(&self, state: &AppState) -> Entry {
-        // A synthetic entry for the root
-        let root = Entry {
-            path: state.root.clone(),
-            subtree: self.entries.borrow_tree().to_vec(),
-            ..Default::default()
-        };
-        let mut cursor = &root;
+    fn view_info(&self, state: &AppState) -> EntryInfo {
+        let mut result = None;
+        let mut cursor = self.entries.borrow_tree();
 
         for id in state.skip_view.iter() {
-            if let Ok(idx) = cursor.subtree.binary_search_by_key(id, |(id, _)| *id) {
-                cursor = &cursor.subtree[idx].1;
+            if let Ok(idx) = cursor.binary_search_by_key(id, |(id, _)| *id) {
+                result = Some(EntryInfo::from(&cursor[idx].1));
+                cursor = &cursor[idx].1.subtree;
             }
         }
 
-        cursor.clone()
+        if let Some(info) = result {
+            info
+        } else {
+            let tree = self.entries.borrow_tree();
+            let size = tree.iter().map(|(_, it)| it.size).sum();
+            let count = tree.iter().map(|(_, it)| it.nfiles).sum();
+
+            EntryInfo {
+                path: state.root.clone(),
+                size,
+                nfiles: count,
+
+                ..Default::default()
+            }
+        }
     }
 
     fn get_view(&self, state: &AppState) -> &[(usize, Entry)] {
@@ -1143,6 +1418,23 @@ impl App {
                 }
             })
     }
+}
+
+fn get_title(state: &AppState, info: &EntryInfo) -> OsString {
+    let mut title = if info.tag.is_none() {
+        info.path.clone().into_os_string()
+    } else if let Some(tag) = &info.tag {
+        info.path.join("**").with_extension(tag).into_os_string()
+    } else {
+        state.root.as_os_str().to_os_string()
+    };
+
+    title.push(format!(
+        " | {} ({} files)",
+        format_size(info.size, DECIMAL),
+        info.nfiles.separate_with_commas()
+    ));
+    title
 }
 
 fn get_selection<'a>(
@@ -1164,6 +1456,30 @@ fn get_selection<'a>(
     None
 }
 
+fn par_tree_items(entries: TreeSlice) -> Vec<TreeItem<'static, usize>> {
+    use rayon::prelude::*;
+
+    entries
+        .par_iter()
+        .map(|(k, v)| {
+            let title = v.path.file_name().unwrap_or_default();
+            let text = format!("[{}] {}", format_size(v.size, DECIMAL), title.display());
+
+            if v.subtree.is_empty() {
+                TreeItem::new_leaf(*k, text)
+            } else {
+                let subtree = if v.nfiles > ENTRY_CHUNK_SIZE {
+                    par_tree_items(v.subtree.as_slice())
+                } else {
+                    tree_items(v.subtree.as_slice())
+                };
+
+                make_tree_node(k, text, subtree)
+            }
+        })
+        .collect()
+}
+
 fn tree_items(entries: TreeSlice) -> Vec<TreeItem<'static, usize>> {
     entries
         .iter()
@@ -1174,18 +1490,28 @@ fn tree_items(entries: TreeSlice) -> Vec<TreeItem<'static, usize>> {
                 TreeItem::new_leaf(*k, text)
             } else {
                 let subtree = tree_items(v.subtree.as_slice());
-                let ids = subtree
-                    .iter()
-                    .map(|it| it.identifier())
-                    .cloned()
-                    .collect_vec();
-                TreeItem::new(*k, text, subtree)
-                    .context(format!("{ids:?}"))
-                    .unwrap()
+                make_tree_node(k, text, subtree)
             }
         })
         .collect_vec()
 }
+
+fn make_tree_node(
+    k: &usize,
+    text: String,
+    subtree: Vec<TreeItem<'static, usize>>,
+) -> TreeItem<'static, usize> {
+    let ids = subtree
+        .iter()
+        .map(|it| it.identifier())
+        .cloned()
+        .collect_vec();
+
+    TreeItem::new(*k, text, subtree)
+        .context(format!("{ids:?}"))
+        .unwrap()
+}
+
 impl StatefulWidget for &App {
     type State = AppState;
 
