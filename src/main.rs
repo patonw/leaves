@@ -1,7 +1,7 @@
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
-use std::hash::{DefaultHasher, Hash as _, Hasher as _};
+use std::hash::{DefaultHasher, Hash, Hasher as _};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
@@ -45,6 +45,13 @@ pub struct Args {
     #[arg(default_value = ".")]
     path: PathBuf,
 
+    /// Maximum depth of tree to keep in memory.
+    ///
+    /// Subtrees below this depth are replaced with summary nodes.
+    /// Does not affect scan depth.
+    #[arg(short = 'd', long, default_value_t = 5)]
+    max_depth: usize,
+
     /// Group files in a directory by extension
     #[arg(short, long)]
     group: bool,
@@ -79,7 +86,7 @@ pub struct Args {
 
 type Forest = Vec<(usize, Entry)>;
 type TreeSlice<'a> = &'a [(usize, Entry)];
-type LineageMap = HashMap<(PathBuf, Option<OsString>), HashSet<Entry>>;
+type LineageMap = HashMap<(PathBuf, Option<OsString>), HashMap<PathBuf, Entry>>;
 
 #[derive(Clone, Default)]
 pub struct StackAddr<'a>(Option<(usize, &'a StackAddr<'a>)>);
@@ -172,10 +179,29 @@ pub struct Entry {
     tag: Option<OsString>,
     size: usize,
     nfiles: usize,
+    leaves: usize,
     subtree: Forest,
     color: Color,
     is_group: bool,
 }
+
+#[derive(Default, Clone, Debug)]
+pub struct ByPathTag(Entry);
+
+impl Hash for ByPathTag {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.path.hash(state);
+        self.0.tag.hash(state);
+    }
+}
+
+impl PartialEq for ByPathTag {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.path == other.0.path && self.0.tag == other.0.tag
+    }
+}
+
+impl Eq for ByPathTag {}
 
 // TODO: consolidation/composition
 #[derive(Default, Clone, Debug, Hash, Eq, PartialEq)]
@@ -184,6 +210,7 @@ pub struct EntryInfo {
     tag: Option<OsString>,
     size: usize,
     nfiles: usize,
+    leaves: usize,
 }
 
 impl From<&Entry> for EntryInfo {
@@ -193,6 +220,7 @@ impl From<&Entry> for EntryInfo {
             tag,
             size,
             nfiles,
+            leaves,
             ..
         } = value;
 
@@ -201,6 +229,7 @@ impl From<&Entry> for EntryInfo {
             tag: tag.clone(),
             size: *size,
             nfiles: *nfiles,
+            leaves: *leaves,
         }
     }
 }
@@ -239,17 +268,6 @@ where
 {
     One(T),
     Two(T, T),
-}
-
-impl<P: AsRef<Path>> From<(P, usize)> for Entry {
-    fn from((path, size): (P, usize)) -> Self {
-        let path = PathBuf::from(path.as_ref());
-        Self {
-            path,
-            size,
-            ..Default::default()
-        }
-    }
 }
 
 fn dir_color(dir_path: impl AsRef<Path>) -> Color {
@@ -292,14 +310,20 @@ fn regroup(entries: Vec<Entry>) -> Vec<Entry> {
             } else {
                 let label = format!("*.{}", k.display());
                 let size = v.iter().map(|it| it.size).sum();
-                let count = v.iter().map(|it| it.nfiles).sum();
+                let nfiles = v.iter().map(|it| it.nfiles).sum();
+                let leaves = if v.is_empty() {
+                    1
+                } else {
+                    v.iter().map(|it| it.leaves).sum()
+                };
                 let color = v[0].color;
                 let subtree = cumsum_size(v);
 
                 Entry {
                     path: label.into(),
                     size,
-                    nfiles: count,
+                    nfiles,
+                    leaves,
                     subtree,
                     color,
                     is_group: true,
@@ -371,6 +395,7 @@ fn walk_fs(args: &Args, state: Arc<Mutex<ScanState>>) -> Result<Forest> {
                         path: ent.path().into(),
                         size: metadata.len() as usize,
                         nfiles: 1,
+                        leaves: 1,
                         color,
                         ..Default::default()
                     };
@@ -516,7 +541,7 @@ fn make_forest(
     leaves: impl IntoIterator<Item = Entry>,
 ) -> Vec<(usize, Entry)> {
     let root = root.as_ref().canonicalize().unwrap_or(args.path.clone());
-    let (kidding, extensions) = rehash(args, leaves);
+    let (kidding, extensions) = rehash(args, &root, leaves);
 
     let mut kidding = kidding;
 
@@ -527,6 +552,7 @@ fn make_forest(
                 let subtree = treeify(args, &mut kidding, &root, &Some(ext.clone()));
                 let size = subtree.iter().map(|(_, it)| it.size).sum();
                 let nfiles = subtree.iter().map(|(_, it)| it.nfiles).sum();
+                let leaves = subtree.iter().map(|(_, it)| it.leaves).sum();
 
                 let label = if ext.is_empty() {
                     "(none)".into()
@@ -540,6 +566,7 @@ fn make_forest(
                     path,
                     size,
                     nfiles,
+                    leaves,
                     subtree,
                     color,
                     is_group: true,
@@ -593,6 +620,11 @@ fn merge_entries(mut left: Entry, right: Entry) -> Entry {
     left.subtree = merge_forests(left.subtree, right.subtree);
     left.size += right.size;
     left.nfiles += right.nfiles;
+    left.leaves = if left.subtree.is_empty() {
+        1
+    } else {
+        left.subtree.iter().map(|(_, it)| it.leaves).sum()
+    };
 
     left
 }
@@ -635,9 +667,15 @@ fn merge_forests(left: Forest, right: Forest) -> Vec<(usize, Entry)> {
     cumsum_size(combined)
 }
 
-fn rehash(args: &Args, leaves: impl IntoIterator<Item = Entry>) -> (LineageMap, HashSet<OsString>) {
+fn rehash(
+    args: &Args,
+    root: impl AsRef<Path>,
+    leaves: impl IntoIterator<Item = Entry>,
+) -> (LineageMap, HashSet<OsString>) {
     let mut kidding: LineageMap = Default::default();
     let mut extensions: HashSet<OsString> = Default::default();
+
+    let root_depth = root.as_ref().components().count();
 
     for entry in leaves {
         let ext = if args.xray {
@@ -651,16 +689,54 @@ fn rehash(args: &Args, leaves: impl IntoIterator<Item = Entry>) -> (LineageMap, 
             extensions.insert(ext.clone());
         }
 
+        let color = entry.color;
         let mut cursor = entry;
+        let comps = cursor.path.components().skip(root_depth).collect_vec();
+
+        if comps.len() > args.max_depth {
+            // Create/Update a summary node and drop entry
+            let mut summary_path = root.as_ref().to_path_buf();
+            summary_path.extend(comps.iter().take(args.max_depth));
+            let summary_parent = summary_path.to_path_buf();
+
+            if let Some(ext) = cursor.path.extension() {
+                summary_path.extend(["**"]);
+                summary_path.set_extension(ext);
+            } else {
+                summary_path.extend(["(none)"]);
+            }
+
+            let siblings = kidding
+                .entry((summary_parent.clone(), ext.clone()))
+                .or_default();
+            let entry = siblings
+                .entry(summary_path.clone())
+                .or_insert_with(|| Entry {
+                    path: summary_path,
+                    color,
+                    leaves: 1,
+                    ..Default::default()
+                });
+            entry.nfiles += cursor.nfiles;
+            entry.size += cursor.size;
+
+            cursor = Entry {
+                path: summary_parent,
+                color,
+                tag: ext.clone(),
+                ..Default::default()
+            }
+        }
 
         while let Some(parent) = cursor.path.parent() {
             let parent = parent.to_path_buf();
+            let path = cursor.path.to_path_buf();
             let siblings = kidding.entry((parent.clone(), ext.clone())).or_default();
-            if siblings.contains(&cursor) {
+            if siblings.contains_key(&path) {
                 break;
             }
 
-            siblings.insert(cursor);
+            siblings.insert(path, cursor);
             let color = dir_color(&parent);
             cursor = Entry {
                 path: parent,
@@ -680,7 +756,7 @@ fn treeify(args: &Args, kidding: &mut LineageMap, path: &Path, ext: &Option<OsSt
     };
 
     let mut entries = entries
-        .into_iter()
+        .into_values()
         .map(|mut it| {
             let subtree = treeify(args, kidding, &it.path, ext);
             if !subtree.is_empty() {
@@ -690,7 +766,10 @@ fn treeify(args: &Args, kidding: &mut LineageMap, path: &Path, ext: &Option<OsSt
                 if it.nfiles == 0 {
                     it.nfiles = subtree.iter().map(|(_, it)| it.nfiles).sum();
                 }
+                it.leaves = subtree.iter().map(|(_, it)| it.leaves).sum();
                 it.subtree = subtree;
+            } else {
+                it.leaves = 1;
             }
 
             it
@@ -984,23 +1063,34 @@ impl App {
                 let (leaves, count) = match mode {
                     AppMode::Normal => {
                         self.args.xray = false;
-                        self.reserve
-                            .extend_from_slice(&deforest(forest).collect_vec());
                         state.root = self.args.path.clone();
+
+                        let count = self.reserve.len()
+                            + self
+                                .entries
+                                .borrow_tree()
+                                .iter()
+                                .map(|(_, it)| it.leaves)
+                                .sum::<usize>();
                         let items = std::mem::take(&mut self.reserve);
-                        let count = items.len();
-                        (Either::Left(items.into_iter()), Some(count))
+                        let items = items.into_iter().chain(deforest(forest));
+                        (Either::Left(items), Some(count))
                     }
                     AppMode::Xray => {
                         self.args.xray = true;
                         state.root = self.args.path.clone();
-                        let count = key_range(self.entries.borrow_tree()).map(|r| r.end);
-                        (Either::Right(deforest(forest)), count)
+                        let count = self
+                            .entries
+                            .borrow_tree()
+                            .iter()
+                            .map(|(_, it)| it.leaves)
+                            .sum();
+                        (Either::Right(deforest(forest)), Some(count))
                     }
                     AppMode::Scatter => {
                         self.args.xray = true;
 
-                        let count = state.view_info.as_ref().map(|it| it.nfiles);
+                        let count = state.view_info.as_ref().map(|it| it.leaves);
                         let pruned = prune_view(&mut forest, state.skip_view.as_slice());
                         self.reserve = deforest(forest).collect_vec();
                         state.root = restore_view.to_path_buf();
@@ -1155,6 +1245,10 @@ impl App {
             title.push(" | ".into());
             title.push(format_size(info.size, DECIMAL).bold());
             title.push(format!(" ({} files)", info.nfiles.separate_with_commas()).into());
+
+            if state.diagnostic {
+                title.push(format!(" [{} leaves]", info.leaves.separate_with_commas()).into());
+            }
         } else {
             title.push("leaves".cyan().bold())
         }
@@ -1257,6 +1351,12 @@ impl App {
                         .display()
                 ),
             ]);
+
+            if state.diagnostic
+            // && entry.subtree.is_empty()
+            {
+                text.push(format!("leaves: {}", &entry.leaves.separate_with_commas()));
+            }
 
             if entry.nfiles > 1 {
                 // is dir
@@ -1393,12 +1493,14 @@ impl App {
         } else {
             let tree = self.entries.borrow_tree();
             let size = tree.iter().map(|(_, it)| it.size).sum();
-            let count = tree.iter().map(|(_, it)| it.nfiles).sum();
+            let nfiles = tree.iter().map(|(_, it)| it.nfiles).sum();
+            let leaves = tree.iter().map(|(_, it)| it.leaves).sum();
 
             EntryInfo {
                 path: state.root.clone(),
                 size,
-                nfiles: count,
+                nfiles,
+                leaves,
 
                 ..Default::default()
             }
@@ -1468,7 +1570,7 @@ fn par_tree_items(entries: TreeSlice) -> Vec<TreeItem<'static, usize>> {
             if v.subtree.is_empty() {
                 TreeItem::new_leaf(*k, text)
             } else {
-                let subtree = if v.nfiles > ENTRY_CHUNK_SIZE {
+                let subtree = if v.leaves > ENTRY_CHUNK_SIZE {
                     par_tree_items(v.subtree.as_slice())
                 } else {
                     tree_items(v.subtree.as_slice())
