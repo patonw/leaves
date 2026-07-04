@@ -31,7 +31,7 @@ use ratatui::{
 };
 
 use thousands::Separable;
-use tracing::instrument;
+use tracing::{Level, instrument, span};
 use tui_tree_widget::{Scrollbar, Tree, TreeItem, TreeState};
 
 use clap::Parser;
@@ -100,7 +100,7 @@ type Forest = Vec<(usize, Entry)>;
 type TreeSlice<'a> = &'a [(usize, Entry)];
 type LineageMap = HashMap<(PathBuf, Option<OsString>), HashMap<PathBuf, Entry>>;
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug)]
 pub struct StackAddr<'a>(Option<(usize, &'a StackAddr<'a>)>);
 
 impl<'a> Iterator for &StackAddr<'a> {
@@ -123,6 +123,9 @@ impl<'a> StackAddr<'a> {
     }
 }
 
+// Items are sorted by size rather than path so we need to do a linear scan.
+// This can be rather slow with wide trees, especially in X-ray mode with
+// a large number of extensions and top-level directories.
 pub fn tree_find_path(
     tree: TreeSlice,
     path: &Path,
@@ -160,6 +163,8 @@ fn prune_entry(
     // Traverse twice instead of using a parent var to appease borrow checker
     // Could also use an parent + Some(child_idx) to represent cursor, but that just makes
     // the single traversal more complicated for little practical gain.
+    tracing::debug!(?view_addr, "Pruning entry at address");
+
     let mut addr = Vec::new();
     let mut cursor = &*forest;
     for id in view_addr {
@@ -171,6 +176,8 @@ fn prune_entry(
         }
     }
 
+    tracing::debug!(?addr, "Resolved view to indices");
+
     // Second traversal to the parent Vec, then splice out the entry
     // to ensure we don't leave dangling empty directories that will
     // be confused as empty leaves.
@@ -181,6 +188,7 @@ fn prune_entry(
         }
 
         let (_, entry) = cursor.remove(last_idx);
+        tracing::debug!(entry=?DbgEntry(&entry), "Extracted entry from tree");
 
         // And now a third pass to fix all the counters for surgical edits
         let mut cursor = &mut *forest;
@@ -192,6 +200,8 @@ fn prune_entry(
 
             cursor = &mut cursor[*idx].1.subtree;
         }
+
+        tracing::debug!("Fixed ancestor counts");
 
         Either::Left(entry)
     } else {
@@ -280,6 +290,25 @@ impl<'a> Debug for DbgTrees<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let tmp = self.0.iter().map(|(i, v)| (*i, DbgEntry(v))).collect_vec();
         Debug::fmt(&tmp, f)
+    }
+}
+
+// Lazy debugging wrapper for forests to avoid allocs if not logging.
+pub struct CountedForest<'a>(TreeSlice<'a>);
+
+impl<'a> Debug for CountedForest<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let n_trees = self.0.len();
+        let size: usize = self.0.iter().map(|(_, it)| it.size).sum();
+        let n_leaves: usize = self.0.iter().map(|(_, it)| it.leaves).sum();
+        let n_files: usize = self.0.iter().map(|(_, it)| it.nfiles).sum();
+
+        f.debug_struct("Forest")
+            .field("trees", &n_trees)
+            .field("size", &size)
+            .field("n_leaves", &n_leaves)
+            .field("n_files", &n_files)
+            .finish()
     }
 }
 
@@ -531,6 +560,7 @@ fn par_forest(
 
     let num_threads = num_workers.map(|x| x.min(num_cores)).unwrap_or(num_cores);
 
+    tracing::info!("Building forest in parallel with {num_threads} workers");
     if num_threads <= 1 {
         return make_forest(args, root, leaves);
     }
@@ -565,13 +595,23 @@ fn par_forest(
 
         // Reduction loop to a single forest
         loop {
-            let mut results = handles
-                .into_iter()
-                .map(|h| match h {
-                    Either::Left(h) => h.join().expect("Couldn't join threads"),
-                    Either::Right(v) => v,
-                })
-                .collect_vec();
+            let mut results = span!(Level::DEBUG, "joining threads").in_scope(|| {
+                handles
+                    .into_iter()
+                    .map(|h| match h {
+                        Either::Left(h) => h.join().expect("Couldn't join threads"),
+                        Either::Right(v) => v,
+                    })
+                    .inspect(|forest| {
+                        tracing::trace!(forest = ?CountedForest(forest), "Make/merge forest result.")
+                    })
+                    .collect_vec()
+            });
+
+            tracing::debug!(
+                shards = results.len(),
+                "Forest workers done. Merging results."
+            );
 
             if results.len() <= 1 {
                 let Some(result) = results.pop() else {
@@ -616,9 +656,12 @@ fn make_forest(
 
     if args.xray {
         tracing::debug!(
-            "making x-ray forest with extensions {extensions:?} from {} entries",
+            "making x-ray forest with {} extensions ({:?}...) from {} nodes",
+            extensions.len(),
+            extensions.iter().take(10).collect_vec(),
             kidding.len()
         );
+
         let entries = extensions
             .iter()
             .map(|ext| {
@@ -626,6 +669,8 @@ fn make_forest(
                 let size = subtree.iter().map(|(_, it)| it.size).sum();
                 let nfiles = subtree.iter().map(|(_, it)| it.nfiles).sum();
                 let leaves = subtree.iter().map(|(_, it)| it.leaves).sum();
+
+                tracing::trace!(ft = ?CountedForest(&subtree), "x-ray for {}", ext.display());
 
                 let label = if ext.is_empty() {
                     "(none)".into()
@@ -647,6 +692,9 @@ fn make_forest(
                 }
             })
             .collect_vec();
+
+        tracing::debug!("Rolled up entries into {} trees", entries.len());
+
         cumsum_size(sort_largest(entries))
     } else {
         treeify(args, &mut kidding, &root, &Default::default())
@@ -879,7 +927,7 @@ fn ext_color(ext: &OsStr) -> Color {
 }
 
 pub fn init_logging() -> Result<()> {
-    use tracing_subscriber::{EnvFilter, prelude::*};
+    use tracing_subscriber::{EnvFilter, fmt::format::FmtSpan, prelude::*};
 
     let proj = env!("CARGO_CRATE_NAME").to_uppercase(); // need compile-time uppercase
     let Some(log_dir_env) = std::env::var_os(format!("{proj}_LOG_DIR")) else {
@@ -899,6 +947,7 @@ pub fn init_logging() -> Result<()> {
     let filter = EnvFilter::from_default_env();
 
     let file_subscriber = tracing_subscriber::fmt::layer()
+        .with_span_events(FmtSpan::CLOSE)
         .with_file(true)
         .with_line_number(true)
         .with_writer(log_file)
@@ -941,19 +990,22 @@ fn main() -> Result<()> {
         })
     };
 
-    let quit = ratatui::run(|term| ScanUI::new(scan_state).run(term))?;
+    let quit = span!(Level::DEBUG, "Scanning")
+        .in_scope(|| ratatui::run(|term| ScanUI::new(scan_state).run(term)))?;
     if quit {
         return Ok(());
     }
 
-    let scanned = th
-        .join()
-        .map_err(|_e| eyre::eyre!("Failed to spawn scanner"))??;
+    let scanned = span!(Level::DEBUG, "Gathering scan results").in_scope(|| {
+        th.join()
+            .map_err(|_e| eyre::eyre!("Failed to join scanner thread"))
+    })??;
 
     // After initial scan, default this to 1 for on-demand expansion
     args.max_depth = 1;
 
-    let mut app = App::new(args.clone(), scanned);
+    let mut app =
+        span!(Level::DEBUG, "Initializing app").in_scope(|| App::new(args.clone(), scanned));
 
     ratatui::run(|terminal| app.run(terminal))
 }
@@ -1090,7 +1142,6 @@ enum AppMode {
     #[default]
     Normal,
     Xray,
-    Scatter,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1138,13 +1189,16 @@ impl AppState {
 }
 
 impl App {
+    #[instrument(level = "debug", skip_all)]
     pub fn new(args: Args, entries: Forest) -> Self {
-        let tree_items = par_tree_items(entries.as_slice());
-        let focus = TreeFocusBuilder {
-            tree: entries.clone(),
-            focus_builder: |_| None,
-        }
-        .build();
+        let tree_items = build_nav_tree(entries.as_slice());
+        let focus = span!(Level::DEBUG, "Wrapping initial tree focus").in_scope(|| {
+            TreeFocusBuilder {
+                tree: entries,
+                focus_builder: |_| None,
+            }
+            .build()
+        });
 
         Self {
             args,
@@ -1178,22 +1232,26 @@ impl App {
             self.handle_action(terminal, &mut state)?;
 
             if state.view_info.is_none() {
-                let info = self.view_info(&state);
+                span!(Level::DEBUG, "Refreshing view info").in_scope(|| {
+                    let info = self.view_info(&state);
 
-                let title = get_title(&state, &info);
-                state.title = Some(title);
-                state.view_info = Some(info);
+                    let title = get_title(&state, &info);
+                    state.title = Some(title);
+                    state.view_info = Some(info);
+                });
             }
 
             if !state.click_addr.is_empty() {
-                let addr = std::mem::take(&mut state.click_addr);
-                let mut selection = state.skip_view.clone();
-                selection.extend_from_slice(&addr);
-                self.entries.select(&selection);
+                span!(Level::DEBUG, "Updating selection from area click").in_scope(|| {
+                    let addr = std::mem::take(&mut state.click_addr);
+                    let mut selection = state.skip_view.clone();
+                    selection.extend_from_slice(&addr);
+                    self.entries.select(&selection);
 
-                state.show_selection(&addr);
+                    state.show_selection(&addr);
 
-                state.click_pos = None;
+                    state.click_pos = None;
+                });
             }
 
             self.selection.clear();
@@ -1201,9 +1259,9 @@ impl App {
                 .extend_from_slice(state.tree_state.selected());
 
             terminal.draw(|frame| self.draw(frame, &mut state))?;
-            if self.handle_events(&mut state)? {
-                self.entries.select(&state.qual_select());
-            }
+            while !self.handle_events(&mut state)? {}
+
+            self.entries.select(&state.qual_select());
 
             if let Some(entry) = self.entries.borrow_focus() {
                 if let Some(tag) = &entry.tag {
@@ -1276,14 +1334,23 @@ impl App {
         let title_text = Line::from(title);
         window = window.title(title_text.centered());
 
+        if self.args.xray {
+            window = window.border_type(BorderType::HeavyDoubleDashed);
+
+            if !state.skip_view.is_empty()
+                && let Some(tag) = &state.tag
+            {
+                let style = Style::from(ext_color(tag));
+                window = window.border_style(style);
+            }
+        }
+
         let mut status_line = match state.mode {
             AppMode::Normal => Line::from(vec![
                 " Mode: normal ".into(),
                 " | Keys: ".bold(),
                 " x".blue().bold(),
                 "-ray ".into(),
-                " s".blue().bold(),
-                "catter ".into(),
             ]),
 
             AppMode::Xray => Line::from(vec![
@@ -1291,17 +1358,6 @@ impl App {
                 " | Keys: ".bold(),
                 " (".into(),
                 "x".blue().bold(),
-                "/".into(),
-                "s".blue().bold(),
-                ")Normal ".into(),
-            ]),
-            AppMode::Scatter => Line::from(vec![
-                " Mode: scatter ".into(),
-                " | Keys: ".bold(),
-                " (".into(),
-                "x".blue().bold(),
-                "/".into(),
-                "s".blue().bold(),
                 ")Normal ".into(),
             ]),
         };
@@ -1403,7 +1459,7 @@ impl App {
             if entry.nfiles > 1 {
                 // is dir
                 text.push(format!("files: {}", &entry.nfiles.separate_with_commas()));
-            } else {
+            } else if entry.subtree.is_empty() {
                 // is file
                 text.push(format!("bytes: {}", &entry.size.separate_with_commas()));
             }
@@ -1428,17 +1484,23 @@ impl App {
             Event::Key(key_event) if key_event.kind == KeyEventKind::Press => {
                 self.handle_key_event(state, key_event)
             }
+            Event::Key(key_event) if key_event.kind == KeyEventKind::Press => false,
             Event::Mouse(mouse) => match mouse.kind {
                 MouseEventKind::ScrollDown => state.tree_state.scroll_down(1),
                 MouseEventKind::ScrollUp => state.tree_state.scroll_up(1),
                 MouseEventKind::Down(_button) => {
                     let position = Position::new(mouse.column, mouse.row);
+                    state.tree_state.click_at(position);
+
+                    // This requires two cycles so we take advantage of the mouse up event
                     state.click_pos = Some(position);
                     state.click_addr.clear();
-                    state.tree_state.click_at(position)
+                    true
                 }
+                MouseEventKind::Up(_button) => true,
                 _ => false,
             },
+            Event::Resize(_, _) => true,
             _ => false,
         };
 
@@ -1464,13 +1526,6 @@ impl App {
                 state.view_info = None;
                 true
             }
-            KeyCode::Char('s') => {
-                state.action = AppAction::SwitchMode(match state.mode {
-                    AppMode::Normal => AppMode::Scatter,
-                    _ => AppMode::Normal,
-                });
-                true
-            }
             KeyCode::Char('x') => {
                 state.action = AppAction::SwitchMode(match state.mode {
                     AppMode::Normal => AppMode::Xray,
@@ -1486,9 +1541,17 @@ impl App {
                 state.action = AppAction::Deflate;
                 true
             }
-            KeyCode::Char('\n' | ' ') => state.tree_state.toggle_selected(),
-            KeyCode::Char('<') => state.tree_state.close_all(),
-            KeyCode::Left => state.tree_state.key_left(),
+            KeyCode::Char(' ') => state.tree_state.toggle_selected(),
+            KeyCode::Char('<') => {
+                self.selection.clear();
+                state.tree_state.close_all()
+            }
+            KeyCode::Left => {
+                let dirty = state.tree_state.key_left();
+
+                tracing::debug!(sel=?state.tree_state.selected(), qual=?state.qual_select(), "Key left");
+                dirty
+            }
             KeyCode::Right => state.tree_state.key_right(),
             KeyCode::Down => state.tree_state.key_down(),
             KeyCode::Up => state.tree_state.key_up(),
@@ -1523,7 +1586,29 @@ impl App {
             state.skip_view.pop();
         }
 
-        self.tree_items = par_tree_items(self.get_view(state));
+        if state
+            .view_info
+            .as_ref()
+            .map(|it| it.leaves > ENTRY_CHUNK_SIZE * 8)
+            .unwrap_or(true)
+        {
+            // This takes a long time on large trees so do it the background
+            let old_nav = std::mem::take(&mut self.tree_items);
+
+            std::thread::spawn(move || {
+                span!(Level::DEBUG, "Dropping old navigator tree").in_scope(|| drop(old_nav))
+            });
+        }
+
+        // Careful here. Plain assignment generates a large chunk of overhead (drop/dealloc?).
+        span!(Level::DEBUG, "Synchronizing view", addr=?state.skip_view).in_scope(|| {
+            // self.tree_items = build_nav_tree(self.get_view(state));
+            self.tree_items.clear();
+            self.tree_items.extend(build_nav_tree(self.get_view(state)));
+        });
+
+        tracing::debug!(items = self.tree_items.len(), "Rebuilt navigator tree");
+
         state.show_selection(&self.selection);
 
         state.view_info = None;
@@ -1532,7 +1617,7 @@ impl App {
 
     fn exit(&mut self) -> bool {
         self.exit = true;
-        false
+        true
     }
 
     fn view_info(&self, state: &AppState) -> EntryInfo {
@@ -1550,7 +1635,6 @@ impl App {
             info
         } else {
             let tree = self.entries.borrow_tree();
-            tracing::debug!("Calculating root view {:?}", DbgTrees(tree));
 
             let size = tree.iter().map(|(_, it)| it.size).sum();
             let nfiles = tree.iter().map(|(_, it)| it.nfiles).sum();
@@ -1589,7 +1673,13 @@ impl App {
             AppAction::Noop => {}
             AppAction::SwitchMode(mode) => {
                 let restore_info = self.view_info(state);
-                let restore_view = restore_info.path.as_path();
+                let init_root = self.args.path.canonicalize()?;
+
+                let restore_view = if state.skip_view.is_empty() && init_root == state.root {
+                    None
+                } else {
+                    Some(restore_info.path.as_path())
+                };
                 let restore_path = self.entries.borrow_focus().and_then(|it| {
                     if it.is_group {
                         it.path.parent().map(|p| p.to_path_buf())
@@ -1608,28 +1698,12 @@ impl App {
                         state.root = self.args.path.clone();
 
                         let count = self.reserve.len()
-                            + self
-                                .entries
-                                .borrow_tree()
-                                .iter()
-                                .map(|(_, it)| it.leaves)
-                                .sum::<usize>();
+                            + forest.iter().map(|(_, it)| it.leaves).sum::<usize>();
                         let items = std::mem::take(&mut self.reserve);
                         let items = items.into_iter().chain(deforest(forest));
                         (Either::Left(items), Some(count))
                     }
                     AppMode::Xray => {
-                        self.args.xray = true;
-                        state.root = self.args.path.clone();
-                        let count = self
-                            .entries
-                            .borrow_tree()
-                            .iter()
-                            .map(|(_, it)| it.leaves)
-                            .sum();
-                        (Either::Right(deforest(forest)), Some(count))
-                    }
-                    AppMode::Scatter => {
                         self.args.xray = true;
 
                         let count = state.view_info.as_ref().map(|it| it.leaves);
@@ -1638,11 +1712,18 @@ impl App {
                             Either::Right(forest) => forest,
                         };
                         self.reserve = deforest(forest).collect_vec();
-                        state.root = restore_view.to_path_buf();
+                        state.root = restore_view.unwrap_or(&self.args.path).to_path_buf();
 
                         (Either::Right(deforest(pruned)), count)
                     }
                 };
+
+                tracing::info!(
+                    ?restore_view,
+                    ?restore_path,
+                    ?restore_tag,
+                    "Switching to mode {mode:?} with estimated {count:?} items"
+                );
 
                 // TODO: just create a new UI for this with a proper progress bar
                 terminal.draw(|frame| {
@@ -1661,44 +1742,53 @@ impl App {
                     count,
                 );
 
+                // Actually quite fast up to this point with a wide forest.
+
                 self.entries = TreeFocusBuilder {
                     tree,
                     focus_builder: |_| None,
                 }
                 .build();
 
-                self.tree_items = par_tree_items(self.entries.borrow_tree());
-
                 self.selection = Default::default();
                 state.tag = restore_tag.clone();
-                state.title = Some(restore_view.as_os_str().to_os_string());
+                state.title = None;
                 state.mode = mode;
                 state.click_pos = Default::default();
                 state.click_addr = Default::default();
                 state.tree_state = Default::default();
                 state.skip_view = Default::default();
 
-                if let Some(addr) = tree_find_path(
-                    self.entries.borrow_tree(),
-                    restore_view,
-                    restore_tag.as_deref(),
-                    &StackAddr::root(),
-                ) {
-                    state.skip_view = addr;
-                }
+                span!(Level::DEBUG, "Restoring view.").in_scope(|| {
+                    if let Some(path) = restore_view
+                        && let Some(addr) = tree_find_path(
+                            self.entries.borrow_tree(),
+                            path,
+                            restore_tag.as_deref(),
+                            &StackAddr::root(),
+                        )
+                    {
+                        state.skip_view = addr;
+                    }
+                });
 
-                if let Some(path) = restore_path
-                    && let Some(addr) = tree_find_path(
-                        self.entries.borrow_tree(),
-                        &path,
-                        restore_tag.as_deref(),
-                        &StackAddr::root(),
-                    )
-                {
-                    state.click_addr = addr.into_iter().skip(state.skip_view.len()).collect_vec();
-                }
+                span!(Level::DEBUG, "Restoring selection.").in_scope(|| {
+                    if let Some(path) = restore_path
+                        && let Some(addr) = tree_find_path(
+                            self.entries.borrow_tree(),
+                            &path,
+                            restore_tag.as_deref(),
+                            &StackAddr::root(),
+                        )
+                    {
+                        state.click_addr =
+                            addr.into_iter().skip(state.skip_view.len()).collect_vec();
+                    }
+                });
 
                 self.sync_view(state);
+
+                tracing::debug!("Done with switch.");
             }
             AppAction::Deflate => {
                 let Some(focus) = self.entries.borrow_focus() else {
@@ -1748,101 +1838,107 @@ impl App {
                 }
                 .build();
 
-                self.tree_items = par_tree_items(self.get_view(state));
+                self.tree_items = build_nav_tree(self.get_view(state));
                 state.view_info = None;
             }
             AppAction::Expand => {
-                let Some(focus) = self.entries.borrow_focus() else {
-                    return Ok(());
-                };
-
-                tracing::debug!("Expanding node {:?}", DbgEntry(focus));
-
-                let is_group = focus.is_group;
-                if focus.subtree.is_empty() && focus.nfiles == 1 && !focus.is_group {
-                    return Ok(());
-                }
-
-                // Selective group expansion leads to misleading subdirectory representation
-                if is_group
-                // && !focus.subtree.is_empty()
-                {
-                    return Ok(());
-                }
-
-                let target = if is_group {
-                    focus.path.parent().map(|p| p.to_path_buf())
+                let dirty = if !state.qual_select().is_empty() {
+                    self.expand_selected(state)?
                 } else {
-                    Some(focus.path.to_path_buf())
+                    self.refresh_root(state)?
                 };
 
-                let Some(target) = target else { return Ok(()) }; // is that really ok?
-
-                let tag = focus
-                    .tag
-                    .clone()
-                    .or_else(|| focus.path.extension().map(|s| s.to_os_string()));
-
-                // calculate depth to fold_path
-                let scan_root = self.args.path.canonicalize()?;
-                let rel_target = target.strip_prefix(&state.root)?;
-                let depth = rel_target.components().count();
-
-                tracing::debug!(
-                    "Rescanning {target:?}. Root {scan_root:?}. tag {tag:?}. depth {depth}"
-                );
-
-                let args = self.args.with_depth(depth + self.args.max_depth);
-
-                // Extract forest into mutable and prune the target subtree
-                let entries = std::mem::take(&mut self.entries);
-                let mut forest = entries.into_heads().tree;
-
-                // Discard the entry entirely
-                let pruned = prune_entry(&mut forest, &state.qual_select());
-                match pruned {
-                    Either::Left(it) => tracing::debug!("Pruned entry {:?}", DbgEntry(&it)),
-                    Either::Right(subtree) => tracing::debug!("Pruned {} subtrees", subtree.len()),
+                if dirty {
+                    self.tree_items = build_nav_tree(self.get_view(state));
+                    self.entries.select(&state.qual_select());
+                    state.view_info = None;
                 }
-
-                // should this use state.root instead?
-                let rx = spawn_walker(&args, Default::default(), &target)?;
-
-                let leaves = rx.into_iter().filter(|it| {
-                    it.path.starts_with(target.as_path())
-                        && (tag.is_none()
-                            || it.path.extension().unwrap_or_default() == tag.as_ref().unwrap())
-                });
-
-                // Use rehash to summarize node & rebuild tree structure for summaries
-                let tree = make_forest(&args, &state.root, leaves);
-
-                tracing::debug!("Expanded subtree {:?}", DbgTrees(&tree));
-
-                let tree = merge_forests(forest, tree);
-
-                self.entries = TreeFocusBuilder {
-                    tree,
-                    focus_builder: |_| None,
-                }
-                .build();
-
-                self.tree_items = par_tree_items(self.get_view(state));
-                if is_group {
-                    self.selection.pop();
-                    state.tree_state.key_left();
-
-                    // let mut selection = state.skip_view.clone();
-                    // selection.extend(&self.selection);
-                    // self.entries.select(&selection);
-                }
-
-                self.entries.select(&state.qual_select());
-                state.view_info = None;
             }
         }
 
         Ok(())
+    }
+
+    fn expand_selected(&mut self, state: &mut AppState) -> Result<bool> {
+        let Some(focus) = self.entries.borrow_focus() else {
+            return Ok(false);
+        };
+        tracing::debug!("Expanding node {:?}", DbgEntry(focus));
+        if focus.subtree.is_empty() || focus.is_group {
+            return Ok(false);
+        }
+
+        let target = Some(focus.path.to_path_buf());
+        let Some(target) = target else {
+            return Ok(false);
+        };
+        let tag = focus.tag.clone().or_else(|| {
+            if !focus.subtree.is_empty() {
+                None
+            } else {
+                focus.path.extension().map(|s| s.to_os_string())
+            }
+        });
+
+        let init_root = self.args.path.canonicalize()?;
+        let rel_target = target.strip_prefix(&state.root)?;
+        let depth = rel_target.components().count();
+        tracing::debug!("Rescanning {target:?}. Root {init_root:?}. tag {tag:?}. depth {depth}");
+        let args = self.args.with_depth(depth + self.args.max_depth);
+        let entries = std::mem::take(&mut self.entries);
+        let mut forest = entries.into_heads().tree;
+        let pruned = prune_entry(&mut forest, &state.qual_select());
+        match pruned {
+            Either::Left(it) => tracing::debug!("Pruned entry {:?}", DbgEntry(&it)),
+            Either::Right(subtree) => tracing::debug!("Pruned {} subtrees", subtree.len()),
+        }
+        let rx = spawn_walker(&args, Default::default(), &target)?;
+        let leaves = rx.into_iter().filter(|it| {
+            it.path.starts_with(target.as_path())
+                && (tag.is_none()
+                    || it.path.extension().unwrap_or_default() == tag.as_ref().unwrap())
+        });
+        let tree = make_forest(&args, &state.root, leaves);
+        tracing::debug!("Expanded subtree {:?}", DbgTrees(&tree));
+        let tree = merge_forests(forest, tree);
+        self.entries = TreeFocusBuilder {
+            tree,
+            focus_builder: |_| None,
+        }
+        .build();
+        Ok(true)
+    }
+
+    fn refresh_root(&mut self, state: &mut AppState) -> Result<bool> {
+        let init_root = self.args.path.canonicalize()?;
+        let state_root = &state.root;
+        let nfiles = state.view_info.as_ref().map(|info| info.nfiles);
+        tracing::info!(?init_root, ?state_root, ?nfiles, "Refreshing root forest");
+
+        // Safety for the foot-gun. If you want to rescan from the top, quit and restart.
+        if init_root == state.root {
+            return Ok(false);
+        }
+
+        // Unnecessary, since pruning is based on target depth
+        // let depth = state.root.strip_prefix(scan_root)?.components().count();
+        // let args = self.args.with_depth(depth + self.args.max_depth);
+        // tracing::debug!(depth, "Expansion depth");
+
+        // Don't need to prune since we're replacing the entire tree
+        let rx = spawn_walker(&self.args, Default::default(), &state.root)?;
+
+        let tree = par_forest(&self.args, &state.root, rx, nfiles);
+
+        self.entries = TreeFocusBuilder {
+            tree,
+            focus_builder: |_| None,
+        }
+        .build();
+
+        tracing::debug!("Done refreshing root");
+
+        Ok(true)
     }
 }
 
@@ -1882,48 +1978,181 @@ fn get_selection<'a>(
     None
 }
 
+#[instrument(level = "debug", skip_all)]
+fn build_nav_tree(entries: TreeSlice) -> Vec<TreeItem<'static, usize>> {
+    use crossbeam_channel::{Sender, unbounded};
+    use itertools::Itertools as _;
+    use smallvec::{SmallVec, smallvec};
+    use std::thread;
+
+    type Addr = SmallVec<[usize; 4]>;
+
+    let num_leaves: usize = entries.iter().map(|(_, it)| it.leaves).sum();
+
+    let num_workers = num_leaves / ENTRY_CHUNK_SIZE / 10;
+    let num_cores = thread::available_parallelism()
+        .map(|c| c.get())
+        .unwrap_or(1);
+
+    let num_threads = num_workers.min(num_cores);
+
+    if num_threads <= 1 {
+        return span!(Level::INFO, "skipping parallelism", num_leaves)
+            .in_scope(|| tree_items(entries));
+    }
+
+    let (tx, rx) = unbounded::<(Addr, &Entry)>();
+
+    fn split_tree<'a>(tx: &Sender<(Addr, &'a Entry)>, addr: &StackAddr, entry: &'a Entry) {
+        if entry.leaves < ENTRY_CHUNK_SIZE * 4 {
+            let mut addr: Addr = addr.collect();
+            addr.reverse();
+            tx.send((addr, entry)).expect("Couldn't send via channel");
+            return;
+        }
+
+        for (id, it) in &entry.subtree {
+            let addr = addr.push(*id);
+            split_tree(tx, &addr, it);
+        }
+    }
+
+    span!(Level::DEBUG, "Splitting tree", num_leaves, num_threads).in_scope(|| {
+        let addr = StackAddr::root();
+        for (id, it) in entries {
+            let addr = addr.push(*id);
+            split_tree(&tx, &addr, it);
+        }
+        drop(tx);
+    });
+
+    let mut shards = span!(Level::DEBUG, "transforming subtrees").in_scope(|| {
+        thread::scope(|ts| {
+            let handles = (0..num_threads)
+                .map(|_| {
+                    let rx = rx.clone();
+                    ts.spawn(move || {
+                        let mut branches: HashMap<Addr, TreeItem<'static, usize>> =
+                            Default::default();
+
+                        while let Ok((addr, entry)) = rx.recv() {
+                            let id = addr.last().cloned().unwrap();
+                            let nav = enty_to_nav(id, entry);
+                            branches.insert(addr, nav);
+                        }
+
+                        branches
+                    })
+                })
+                .collect_vec();
+
+            handles
+                .into_iter()
+                .map(|it| it.join().expect("Could not join thread"))
+                .collect_vec()
+        })
+    });
+
+    fn search_shards(
+        addr: &Addr,
+        shards: &mut Vec<HashMap<Addr, TreeItem<'static, usize>>>,
+    ) -> Option<TreeItem<'static, usize>> {
+        for shard in shards {
+            let item = shard.remove(addr);
+            if item.is_some() {
+                return item;
+            }
+        }
+        None
+    }
+
+    fn combine_shards(
+        addr: &Addr,
+        entries: TreeSlice,
+        shards: &mut Vec<HashMap<Addr, TreeItem<'static, usize>>>,
+    ) -> Vec<TreeItem<'static, usize>> {
+        let mut subtrees = vec![];
+        for (id, entry) in entries {
+            let mut addr = addr.clone();
+            addr.push(*id);
+
+            if let Some(tree) = search_shards(&addr, shards) {
+                subtrees.push(tree);
+            } else {
+                let title = entry.path.file_name().unwrap_or_default();
+                let text = format!("[{}] {}", format_size(entry.size, DECIMAL), title.display());
+                if entry.subtree.is_empty() {
+                    subtrees.push(TreeItem::new_leaf(*id, text));
+                } else {
+                    let subtree = combine_shards(&addr, entry.subtree.as_slice(), shards);
+                    subtrees.push(make_tree_node(*id, text, subtree));
+                }
+            }
+        }
+
+        subtrees
+    }
+
+    span!(Level::DEBUG, "combining shards")
+        .in_scope(|| combine_shards(&smallvec![], entries, &mut shards))
+}
+
+// Surprisingly poor performance. Must figure out why.
+#[allow(unused)]
+#[instrument(level = "trace", skip_all)]
 fn par_tree_items(entries: TreeSlice) -> Vec<TreeItem<'static, usize>> {
     use rayon::prelude::*;
 
-    entries
-        .par_iter()
-        .map(|(k, v)| {
-            let title = v.path.file_name().unwrap_or_default();
-            let text = format!("[{}] {}", format_size(v.size, DECIMAL), title.display());
+    let num_leaves: usize = entries.iter().map(|(_, it)| it.leaves).sum();
 
-            if v.subtree.is_empty() {
-                TreeItem::new_leaf(*k, text)
-            } else {
-                let subtree = if v.leaves > ENTRY_CHUNK_SIZE {
-                    par_tree_items(v.subtree.as_slice())
+    span!(
+        Level::TRACE,
+        "Building navigator tree in parallel",
+        num_leaves
+    )
+    .in_scope(|| {
+        entries
+            .par_iter()
+            .map(|(k, v)| {
+                let title = v.path.file_name().unwrap_or_default();
+                let text = format!("[{}] {}", format_size(v.size, DECIMAL), title.display());
+
+                if v.subtree.is_empty() {
+                    TreeItem::new_leaf(*k, text)
                 } else {
-                    tree_items(v.subtree.as_slice())
-                };
+                    let subtree = if v.leaves > ENTRY_CHUNK_SIZE {
+                        par_tree_items(v.subtree.as_slice())
+                    } else {
+                        tree_items(v.subtree.as_slice())
+                    };
 
-                make_tree_node(k, text, subtree)
-            }
-        })
-        .collect()
+                    make_tree_node(*k, text, subtree)
+                }
+            })
+            .collect()
+    })
 }
 
 fn tree_items(entries: TreeSlice) -> Vec<TreeItem<'static, usize>> {
     entries
         .iter()
-        .map(|(k, v)| {
-            let title = v.path.file_name().unwrap_or_default();
-            let text = format!("[{}] {}", format_size(v.size, DECIMAL), title.display());
-            if v.subtree.is_empty() {
-                TreeItem::new_leaf(*k, text)
-            } else {
-                let subtree = tree_items(v.subtree.as_slice());
-                make_tree_node(k, text, subtree)
-            }
-        })
+        .map(|(k, v)| enty_to_nav(*k, v))
         .collect_vec()
 }
 
+fn enty_to_nav(id: usize, entry: &Entry) -> TreeItem<'static, usize> {
+    let title = entry.path.file_name().unwrap_or_default();
+    let text = format!("[{}] {}", format_size(entry.size, DECIMAL), title.display());
+    if entry.subtree.is_empty() {
+        TreeItem::new_leaf(id, text)
+    } else {
+        let subtree = tree_items(entry.subtree.as_slice());
+        make_tree_node(id, text, subtree)
+    }
+}
+
 fn make_tree_node(
-    k: &usize,
+    id: usize,
     text: String,
     subtree: Vec<TreeItem<'static, usize>>,
 ) -> TreeItem<'static, usize> {
@@ -1933,7 +2162,7 @@ fn make_tree_node(
         .cloned()
         .collect_vec();
 
-    TreeItem::new(*k, text, subtree)
+    TreeItem::new(id, text, subtree)
         .context(format!("{ids:?}"))
         .unwrap()
 }
