@@ -117,11 +117,7 @@ impl App {
             AppMode::Normal
         };
 
-        let mut state = AppState {
-            root: self.args.path.to_path_buf(),
-            mode,
-            ..AppState::default()
-        };
+        let mut state = AppState::new(&self.args.path, mode);
 
         while !self.exit {
             if !matches!(state.action, AppAction::Noop) {
@@ -320,56 +316,102 @@ impl App {
 
         frame.render_stateful_widget(widget, sidebar[0], &mut state.tree_state);
 
-        let mut text = vec![];
-        if state.diagnostic {
-            text.extend_from_slice(&[
+        let diag_text = if state.diagnostic {
+            let lines = vec![
                 "--- Diagnostics ---".into(),
                 format!("VW {:?}", &state.skip_view),
                 format!("SL {:?}", state.tree_state.selected()),
                 format!("TG {:?}", &state.tag),
-                "".into(),
-                "--- File info ---".into(),
-            ]);
+            ];
+
+            let lines = lines.into_iter().map(Line::from).collect_vec();
+            Some(Text::from(lines))
+        } else {
+            None
+        };
+
+        let path = self
+            .entries
+            .borrow_focus()
+            .as_ref()
+            .map(|entry| entry.path.clone());
+
+        let path_text = path
+            .as_ref()
+            .map(|it| Text::from(format!("{}", it.display())));
+
+        #[cfg(feature = "clipboard")]
+        if let Some(path) = path
+            && let Some(click) = state.click_pos
+            && sidebar[1].contains(click)
+            && let Some(clipboard) = &mut state.clipboard
+        {
+            let text = path.display().to_string();
+            tracing::info!(text, "Attempting to copy path to clipboard");
+
+            let result = clipboard.set_text(text);
+
+            tracing::debug!(?result, "Clipboard result");
         }
 
+        let mut info_lines = vec![];
         if let Some(entry) = self.entries.borrow_focus() {
-            text.extend_from_slice(&[
-                format!("{}", entry.path.display()),
-                "".into(),
-                format!(
-                    "tag: {}",
-                    entry
-                        .tag
-                        .as_deref()
-                        .or_else(|| entry.path.extension())
-                        .unwrap_or(OsStr::new("(none)"))
-                        .display()
-                ),
-            ]);
-
-            if state.diagnostic
-            // && entry.subtree.is_empty()
-            {
-                text.push(format!("leaves: {}", &entry.leaves.separate_with_commas()));
+            info_lines.extend_from_slice(&[format!(
+                "tag: {}",
+                entry
+                    .tag
+                    .as_deref()
+                    .or_else(|| entry.path.extension())
+                    .unwrap_or(OsStr::new("(none)"))
+                    .display()
+            )]);
+            if state.diagnostic {
+                info_lines.push(format!("leaves: {}", &entry.leaves.separate_with_commas()));
             }
 
             if entry.nfiles > 1 {
                 // is dir
-                text.push(format!("files: {}", &entry.nfiles.separate_with_commas()));
+                info_lines.push(format!("files: {}", &entry.nfiles.separate_with_commas()));
             } else if entry.subtree.is_empty() {
                 // is file
-                text.push(format!("bytes: {}", &entry.size.separate_with_commas()));
+                info_lines.push(format!("bytes: {}", &entry.size.separate_with_commas()));
             }
         }
 
-        let text = Text::from(text.into_iter().map(Line::from).collect_vec());
+        let info_text = Text::from(info_lines.into_iter().map(Line::from).collect_vec());
 
-        frame.render_widget(
-            Paragraph::new(text)
-                .block(Block::new().padding(Padding::proportional(1)))
-                .wrap(Wrap { trim: false }),
-            sidebar[1],
-        );
+        let info_box = Block::new().padding(1.into());
+
+        let mut inspector = vec![];
+
+        if let Some(text) = &diag_text {
+            inspector.push(Constraint::Length(text.height() as u16 + 1));
+        }
+        if let Some(text) = &path_text {
+            let height = text.width().div_ceil(sidebar[1].width as usize) as u16;
+            inspector.push(Constraint::Length(height + 1));
+        }
+
+        inspector.push(Constraint::Min(info_text.height() as u16));
+
+        let inspector = Layout::default()
+            .direction(Direction::Vertical)
+            .flex(ratatui::layout::Flex::Start)
+            .constraints(inspector)
+            .split(info_box.inner(sidebar[1]));
+
+        let widgets = [diag_text, path_text, Some(info_text)]
+            .into_iter()
+            .flatten();
+
+        for (area, text) in inspector.iter().zip(widgets) {
+            frame.render_widget(
+                Paragraph::new(text)
+                    // .block(Block::new().padding(Padding::proportional(1)))
+                    .wrap(Wrap { trim: false }),
+                *area,
+            );
+        }
 
         frame.render_stateful_widget(self, layout[1], state);
     }

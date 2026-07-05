@@ -1,6 +1,6 @@
-use std::ffi::OsString;
 use std::fmt::Debug;
 use std::path::PathBuf;
+use std::{ffi::OsString, path::Path};
 
 use humansize::{DECIMAL, format_size};
 use ratatui::layout::{Position, Rect};
@@ -28,6 +28,9 @@ pub enum AppAction {
 
 #[derive(Default)]
 pub struct AppState {
+    #[cfg(feature = "clipboard")]
+    pub clipboard: Option<arboard::Clipboard>,
+
     pub root: PathBuf,
     pub mode: AppMode,
     pub action: AppAction,
@@ -45,6 +48,16 @@ pub struct AppState {
 }
 
 impl AppState {
+    pub fn new(path: impl AsRef<Path>, mode: AppMode) -> Self {
+        Self {
+            root: path.as_ref().to_path_buf(),
+            mode,
+            #[cfg(feature = "clipboard")]
+            clipboard: arboard::Clipboard::new().ok(),
+            ..Default::default()
+        }
+    }
+
     /// Address of selection qualified with current view
     pub fn qual_select(&self) -> Vec<usize> {
         let mut selection = self.skip_view.clone();
