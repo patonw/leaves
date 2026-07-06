@@ -4,6 +4,8 @@ A text-mode disk usage visualization utility
 
 ## Description
 
+![nixpkgs](./docs/images/leaves-nixpkgs.png)
+
 Leaves is a disk usage analyzer inspired by WinDirStat and QDirStat.
 
 It shows files and directories in a hierarchy of nested rectangles.
@@ -137,6 +139,8 @@ Options:
 
 ### Layout
 
+![normal view](./docs/images/normal-mode.png)
+
 After *leaves* scans the target directory it will enter the main view.
 
 The title bar contains the path of the current view, along with its total size and file count.
@@ -176,15 +180,17 @@ To view files outside the current hierarchy, quit the app and restart with a new
 
 ### Expansion/Deflation
 
-With the limitaions of working with block characters, it is usually not helpful to view millions of files across thousands of directories. This can be visually overwhelming. With each file represented by a handful of characters, little relevant information can be conveyed.
+With the limitations of working with block characters, it is usually not helpful to view millions of files across thousands of directories. This can be visually overwhelming. With each file represented by a handful of characters, little relevant information can be conveyed.
 
-*leaves* will summarize directories below a certain depth, by grouping files of the same extension into a single rectangle with an area propertional to their cumulative size. You can control this depth during launch with `--max-depth`.
+*leaves* will summarize directories below a certain depth, by grouping files of the same extension into a single rectangle with an area proportional to their cumulative size. You can control this depth during launch with `--max-depth`.
 
 During run time, the selected directory can be **e**xpanded or **d**eflated on demand. Deflating a directory will replace its child rectangles with file type summaries.
 
 Expanding a directory will rescan the contents of that directory and more detailed children up to the run time depth. Beyond that depth, files will be grouped into summary nodes, yet again.
 
 The run time depth can be set with the `+` and `-` keys.
+
+![deflated](./docs/images/deflated.png)
 
 ### Modes
 
@@ -196,6 +202,8 @@ To return to normal mode, press the `x` key again.
 
 > [!important]
 > you will not be able to navigate to the parent of the x-rayed directory without returning to normal mode.
+
+![x-ray view](./docs/images/xray-mode.png)
 
 ### Practical Considerations
 
