@@ -21,6 +21,7 @@ where
     Two(T, T),
 }
 
+/// A list of ids stored across stack frames
 #[derive(Clone, Default, Debug)]
 pub struct StackAddr<'a>(pub Option<(usize, &'a StackAddr<'a>)>);
 
@@ -41,6 +42,10 @@ impl<'a> StackAddr<'a> {
 
     pub fn push(&'a self, data: usize) -> Self {
         Self(Some((data, self)))
+    }
+
+    pub fn head(&self) -> Option<&usize> {
+        self.0.as_ref().map(|(id, _)| id)
     }
 }
 

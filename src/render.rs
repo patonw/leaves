@@ -8,11 +8,18 @@ use ratatui::{
     widgets::{Block, BorderType, Fill, Widget},
 };
 
-use crate::core::{Entry, MaybePair, StackAddr, TreeSlice};
-use crate::forest::{key_range, partition};
 use crate::state::AppState;
+use crate::{
+    config::Config,
+    core::{Entry, MaybePair, StackAddr, TreeSlice},
+};
+use crate::{
+    config::DirStyle,
+    forest::{key_range, partition},
+};
 
 pub fn render_subtree(
+    config: &Config,
     state: &mut AppState,
     addr: &StackAddr,
     area: Rect,
@@ -28,7 +35,11 @@ pub fn render_subtree(
     if tree.len() > 1 && (area.height < 2 || area.width <= 2) {
         let head = selection.first();
         let color = tree.first().map(|(_, it)| it.color).unwrap_or_default();
-        let style = Style::from(color);
+        let style = if config.colors.mono() {
+            Style::default()
+        } else {
+            Style::from(color)
+        };
         if tree.iter().any(|(k, _)| Some(k) == head) {
             Fill::new("▓").style(style).render(area, buf);
         } else {
@@ -56,14 +67,15 @@ pub fn render_subtree(
     if tree.len() == 1 {
         let (key, entry) = &tree[0];
 
-        render_entry(state, addr, area, buf, *key, entry, selection);
+        let addr = addr.push(*key);
+        render_entry(config, state, &addr, area, buf, entry, selection);
 
         return;
     }
 
     match partition(tree) {
         MaybePair::One(entries) => {
-            render_subtree(state, addr, area, buf, entries, selection);
+            render_subtree(config, state, addr, area, buf, entries, selection);
             // Paragraph::new(format!("{entries:?}"))
             //     .centered()
             //     .render(area, buf);
@@ -96,18 +108,18 @@ pub fn render_subtree(
                     .split(area);
             }
 
-            render_subtree(state, addr, layout[0], buf, left, selection);
-            render_subtree(state, addr, layout[1], buf, right, selection);
+            render_subtree(config, state, addr, layout[0], buf, left, selection);
+            render_subtree(config, state, addr, layout[1], buf, right, selection);
         }
     }
 }
 
 pub fn render_entry(
+    config: &Config,
     state: &mut AppState,
     addr: &StackAddr,
     area: Rect,
     buf: &mut Buffer,
-    key: usize,
     entry: &Entry,
     selection: &[usize],
 ) {
@@ -120,7 +132,6 @@ pub fn render_entry(
         ..
     } = entry;
 
-    let addr = addr.push(key);
     let title = path.file_name().unwrap_or_default();
     let display = title.display();
 
@@ -130,24 +141,32 @@ pub fn render_entry(
     {
         state.click_area = area;
         state.click_addr.clear();
-        for id in &addr {
+        for id in addr {
             state.click_addr.push(id)
         }
 
         state.click_addr.reverse();
     }
 
-    let (selected, selection) = if selection.first() == Some(&key) {
+    let (selected, selection) = if selection.first() == addr.head() {
         (true, &selection[1..])
     } else {
         (false, [].as_slice())
     };
 
-    let style = Style::from(entry.color);
+    let style = if config.colors.mono() {
+        Style::default()
+    } else {
+        Style::from(entry.color)
+    };
 
     let mut block = Block::bordered()
         .title(display.to_line())
         .border_style(style);
+
+    if config.dir_style == DirStyle::Thick {
+        block = block.border_type(BorderType::Thick);
+    }
 
     if area.height > 1 {
         // let mut a = addr.collect_vec();
@@ -171,6 +190,6 @@ pub fn render_entry(
             .style(style)
             .render(inner, buf);
     } else if inner.height > 2 || inner.width > 2 {
-        render_subtree(state, &addr, inner, buf, subtree, selection);
+        render_subtree(config, state, addr, inner, buf, subtree, selection);
     }
 }

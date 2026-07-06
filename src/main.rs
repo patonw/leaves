@@ -5,6 +5,7 @@ use tracing::{Level, instrument, span};
 
 mod app;
 mod cli;
+mod config;
 mod core;
 mod explorer;
 mod forest;
@@ -15,9 +16,10 @@ mod util;
 
 use app::App;
 use cli::{Args, init_logging};
+use config::Config;
 use scanfs::{ScanState, ScanUI, walk_fs};
 
-use crate::util::SWAP_COLORS;
+use crate::{config::ColorScheme, util::SWAP_COLORS};
 
 #[instrument]
 fn main() -> Result<()> {
@@ -34,11 +36,14 @@ fn main() -> Result<()> {
         args.include_gitexcluded = true;
     }
 
-    if args.swap_colors {
+    let config = Config::new(std::env::vars());
+
+    if config.colors == ColorScheme::Spring {
         SWAP_COLORS.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     args.path = args.path.canonicalize()?;
+    tracing::info!(?config, ?args, "App config");
 
     let scan_state = Arc::new(Mutex::new(ScanState::default()));
 
@@ -68,7 +73,7 @@ fn main() -> Result<()> {
     args.max_depth = 1;
 
     let mut app =
-        span!(Level::DEBUG, "Initializing app").in_scope(|| App::new(args.clone(), scanned));
+        span!(Level::DEBUG, "Initializing app").in_scope(|| App::new(config, args, scanned));
 
     ratatui::run(|terminal| app.run(terminal))
 }

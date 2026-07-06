@@ -17,10 +17,6 @@ pub struct Args {
     #[arg(short = 'd', long, default_value_t = 5)]
     pub max_depth: usize,
 
-    /// Swap the file/directory color schemes
-    #[arg(short = 'c', long, visible_aliases = ["colors", "spring"])]
-    pub swap_colors: bool,
-
     /// Group files by type at the top-level, then split each region by directory.
     #[arg(short, long)]
     pub xray: bool,

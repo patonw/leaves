@@ -25,7 +25,6 @@ use thousands::Separable;
 use tracing::{Level, instrument, span};
 use tui_tree_widget::{Scrollbar, Tree, TreeItem};
 
-use crate::cli::Args;
 use crate::core::{DbgEntry, DbgTrees, ENTRY_CHUNK_SIZE, Entry, EntryInfo, Forest, StackAddr};
 use crate::explorer::build_nav_tree;
 use crate::forest::{
@@ -37,6 +36,7 @@ use crate::state::{
     AppAction, AppMode, AppState, TreeFocus, TreeFocusBuilder, get_selection, get_title,
 };
 use crate::util::ext_color;
+use crate::{cli::Args, config::Config};
 
 struct MouseyTerm<'a>(&'a mut DefaultTerminal);
 
@@ -73,6 +73,7 @@ impl<'a> Drop for MouseyTerm<'a> {
 }
 
 pub struct App {
+    config: Config,
     args: Args,
     exit: bool,
 
@@ -85,7 +86,7 @@ pub struct App {
 
 impl App {
     #[instrument(level = "debug", skip_all)]
-    pub fn new(args: Args, entries: Forest) -> Self {
+    pub fn new(config: Config, args: Args, entries: Forest) -> Self {
         let tree_items = build_nav_tree(entries.as_slice());
         let focus = span!(Level::DEBUG, "Wrapping initial tree focus").in_scope(|| {
             TreeFocusBuilder {
@@ -96,6 +97,7 @@ impl App {
         });
 
         Self {
+            config,
             args,
             exit: false,
             entries: focus,
@@ -687,8 +689,24 @@ impl App {
                 tracing::debug!("Done with switch.");
             }
             AppAction::Deflate => {
+                let mut selection = state.qual_select();
                 let Some(focus) = self.entries.borrow_focus() else {
                     return Ok(());
+                };
+
+                let focus = if focus.subtree.is_empty()
+                    && selection.pop().is_some()
+                    && let Some(entry) = get_selection(&selection, self.entries.borrow_tree())
+                {
+                    let rel_sel = selection
+                        .iter()
+                        .skip(state.skip_view.len())
+                        .cloned()
+                        .collect_vec();
+                    state.tree_state.select(rel_sel);
+                    entry
+                } else {
+                    *focus
                 };
 
                 if focus.is_group || focus.subtree.is_empty() {
@@ -710,7 +728,7 @@ impl App {
                 // Extract forest into mutable and prune the target subtree
                 let entries = std::mem::take(&mut self.entries);
                 let mut forest = entries.into_heads().tree;
-                let pruned = match prune_entry(&mut forest, &state.qual_select()) {
+                let pruned = match prune_entry(&mut forest, &selection) {
                     Either::Left(entry) => {
                         if entry.subtree.is_empty() {
                             unreachable!("Cannot fold a leaf");
@@ -725,8 +743,6 @@ impl App {
                 // let (mut kidding, _) = rehash(&args, &root, deforest(pruned));
                 // let tree = treeify(&args, &mut kidding, &root, &tag);
                 let tree = merge_forests(forest, tree);
-
-                let selection = state.qual_select();
 
                 self.entries = TreeFocusBuilder {
                     tree,
@@ -756,9 +772,26 @@ impl App {
     }
 
     fn expand_selected(&mut self, state: &mut AppState) -> Result<bool> {
+        let mut selection = state.qual_select();
         let Some(focus) = self.entries.borrow_focus() else {
             return Ok(false);
         };
+
+        let focus = if focus.subtree.is_empty()
+            && selection.pop().is_some()
+            && let Some(entry) = get_selection(&selection, self.entries.borrow_tree())
+        {
+            let rel_sel = selection
+                .iter()
+                .skip(state.skip_view.len())
+                .cloned()
+                .collect_vec();
+            state.tree_state.select(rel_sel);
+            entry
+        } else {
+            *focus
+        };
+
         tracing::debug!("Expanding node {:?}", DbgEntry(focus));
         if focus.subtree.is_empty() || focus.is_group {
             return Ok(false);
@@ -783,7 +816,7 @@ impl App {
         let args = self.args.with_depth(depth + self.args.max_depth);
         let entries = std::mem::take(&mut self.entries);
         let mut forest = entries.into_heads().tree;
-        let pruned = prune_entry(&mut forest, &state.qual_select());
+        let pruned = prune_entry(&mut forest, &selection);
         match pruned {
             Either::Left(it) => tracing::debug!("Pruned entry {:?}", DbgEntry(&it)),
             Either::Right(subtree) => tracing::debug!("Pruned {} subtrees", subtree.len()),
@@ -799,7 +832,7 @@ impl App {
         let tree = merge_forests(forest, tree);
         self.entries = TreeFocusBuilder {
             tree,
-            focus_builder: |_| None,
+            focus_builder: |tree| get_selection(&selection, tree),
         }
         .build();
         Ok(true)
@@ -844,6 +877,14 @@ impl StatefulWidget for &App {
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
         let tree = self.get_view(state);
 
-        render_subtree(state, &StackAddr::root(), area, buf, tree, &self.selection);
+        render_subtree(
+            &self.config,
+            state,
+            &StackAddr::root(),
+            area,
+            buf,
+            tree,
+            &self.selection,
+        );
     }
 }
