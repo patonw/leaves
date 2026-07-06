@@ -14,7 +14,8 @@ However, due to the limited resolution of working at a character level, this is 
 
 ## Getting Started
 
-At the time of writing, binary builds are not available yet.
+You can download a pre-built binary for a select number of platforms from the releases page.
+If one is not available for your system, follow this section to build from source.
 
 ### Dependencies
 
