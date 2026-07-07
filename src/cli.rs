@@ -17,6 +17,12 @@ pub struct Args {
     #[arg(short = 'd', long, default_value_t = 5)]
     pub max_depth: usize,
 
+    /// Allow crossing filesystem boundarires.
+    ///
+    /// Use this on platforms without support for querying filesystem id.
+    #[arg(long)]
+    pub cross_fs: bool,
+
     /// Group files by type at the top-level, then split each region by directory.
     #[arg(short, long)]
     pub xray: bool,

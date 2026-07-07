@@ -65,9 +65,13 @@ impl<'a> Deref for MouseyTerm<'a> {
 
 impl<'a> Drop for MouseyTerm<'a> {
     fn drop(&mut self) {
+        use crossterm::style::ResetColor;
+
         let _ = self
             .0
             .backend_mut()
+            .execute(ResetColor)
+            .unwrap()
             .execute(crossterm::event::DisableMouseCapture);
     }
 }

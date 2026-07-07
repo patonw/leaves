@@ -458,37 +458,6 @@ pub fn regroup(entries: Vec<Entry>) -> Vec<Entry> {
     sort_largest(entries)
 }
 
-// Creates forests from leaves in chunks, then merges the results.
-fn _par_forest(
-    args: &Args,
-    root: impl AsRef<Path>,
-    leaves: impl IntoIterator<Item = Entry>,
-    _num_workers: Option<usize>,
-) -> Vec<(usize, Entry)> {
-    use itertools::Itertools as _;
-    use rayon::prelude::*;
-
-    let root = root.as_ref().canonicalize().unwrap_or(args.path.clone());
-
-    // path-based chunking might make for quicker merges... maybe
-    let chunks = leaves
-        .into_iter()
-        .chunks(50_000)
-        .into_iter()
-        .map(|chunk| chunk.collect_vec())
-        .collect_vec();
-
-    chunks
-        .into_par_iter()
-        .map({
-            let args = args.clone();
-            let root = root.clone();
-
-            move |chunk| make_forest(&args, &root, chunk)
-        })
-        .reduce(Vec::new, merge_forests)
-}
-
 pub fn par_forest(
     args: &Args,
     root: impl AsRef<Path>,

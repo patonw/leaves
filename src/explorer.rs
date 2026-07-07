@@ -128,42 +128,6 @@ pub fn build_nav_tree(entries: TreeSlice) -> Vec<TreeItem<'static, usize>> {
         .in_scope(|| combine_shards(&smallvec![], entries, &mut shards))
 }
 
-// Surprisingly poor performance. Must figure out why.
-#[allow(unused)]
-#[instrument(level = "trace", skip_all)]
-pub fn par_tree_items(entries: TreeSlice) -> Vec<TreeItem<'static, usize>> {
-    use rayon::prelude::*;
-
-    let num_leaves: usize = entries.iter().map(|(_, it)| it.leaves).sum();
-
-    span!(
-        Level::TRACE,
-        "Building navigator tree in parallel",
-        num_leaves
-    )
-    .in_scope(|| {
-        entries
-            .par_iter()
-            .map(|(k, v)| {
-                let title = v.path.file_name().unwrap_or_default();
-                let text = format!("[{}] {}", format_size(v.size, DECIMAL), title.display());
-
-                if v.subtree.is_empty() {
-                    TreeItem::new_leaf(*k, text)
-                } else {
-                    let subtree = if v.leaves > ENTRY_CHUNK_SIZE {
-                        par_tree_items(v.subtree.as_slice())
-                    } else {
-                        tree_items(v.subtree.as_slice())
-                    };
-
-                    make_tree_node(*k, text, subtree)
-                }
-            })
-            .collect()
-    })
-}
-
 fn tree_items(entries: TreeSlice) -> Vec<TreeItem<'static, usize>> {
     entries
         .iter()

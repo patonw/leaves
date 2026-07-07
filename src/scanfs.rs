@@ -52,6 +52,7 @@ pub fn spawn_walker(
         .ignore(!args.include_ignored)
         .git_ignore(!args.include_gitignored)
         .git_exclude(!args.include_gitexcluded)
+        .same_file_system(!args.cross_fs)
         .build_parallel();
 
     std::thread::spawn(move || {
