@@ -35,11 +35,7 @@ pub fn render_subtree(
     if tree.len() > 1 && (area.height < 2 || area.width <= 2) {
         let head = selection.first();
         let color = tree.first().map(|(_, it)| it.color).unwrap_or_default();
-        let style = if config.colors.mono() {
-            Style::default()
-        } else {
-            Style::from(color)
-        };
+        let style = Style::from(color);
         if tree.iter().any(|(k, _)| Some(k) == head) {
             Fill::new("▓").style(style).render(area, buf);
         } else {
@@ -154,11 +150,7 @@ pub fn render_entry(
         (false, [].as_slice())
     };
 
-    let style = if config.colors.mono() {
-        Style::default()
-    } else {
-        Style::from(entry.color)
-    };
+    let style = Style::from(entry.color);
 
     let mut block = Block::bordered()
         .title(display.to_line())

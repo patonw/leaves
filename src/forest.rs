@@ -8,11 +8,11 @@ use itertools::Itertools as _;
 use tracing::{Level, span};
 
 use crate::cli::Args;
+use crate::colors::ColorScheme;
 use crate::core::{
     CountedForest, DbgEntry, ENTRY_CHUNK_SIZE, Entry, Forest, LineageMap, MaybePair, StackAddr,
     TreeSlice, cumsum_size, sort_largest,
 };
-use crate::util::{dir_color, ext_color};
 
 pub struct LeafIterator {
     entries: VecDeque<Entry>,
@@ -262,13 +262,14 @@ pub fn merge_forests(left: Forest, right: Forest) -> Vec<(usize, Entry)> {
 // Move entries instead of slicing to reduce allocations. Still need to allocate for interior
 // nodes, but should be an order of magnitude less.
 pub fn make_forest(
+    colors: &ColorScheme,
     args: &Args,
     root: impl AsRef<Path>,
     leaves: impl IntoIterator<Item = Entry>,
 ) -> Vec<(usize, Entry)> {
     let root = root.as_ref().canonicalize().unwrap_or(args.path.clone());
 
-    let (kidding, extensions) = rehash(args, &root, leaves);
+    let (kidding, extensions) = rehash(colors, args, &root, leaves);
 
     let mut kidding = kidding;
 
@@ -296,7 +297,7 @@ pub fn make_forest(
                     format!("**.{}", ext.display())
                 };
 
-                let color = ext_color(ext);
+                let color = colors.ext_color(ext);
                 let path = root.join(label);
                 Entry {
                     path,
@@ -320,6 +321,7 @@ pub fn make_forest(
 }
 
 pub fn rehash(
+    colors: &ColorScheme,
     args: &Args,
     root: impl AsRef<Path>,
     leaves: impl IntoIterator<Item = Entry>,
@@ -375,7 +377,7 @@ pub fn rehash(
             entry.nfiles += cursor.nfiles;
             entry.size += cursor.size;
 
-            let color = dir_color(&summary_parent);
+            let color = colors.dir_color(&summary_parent);
             cursor = Entry {
                 path: summary_parent,
                 color,
@@ -393,7 +395,7 @@ pub fn rehash(
             }
 
             siblings.insert(path, cursor);
-            let color = dir_color(&parent);
+            let color = colors.dir_color(&parent);
             cursor = Entry {
                 path: parent,
                 color,
@@ -459,6 +461,7 @@ pub fn regroup(entries: Vec<Entry>) -> Vec<Entry> {
 }
 
 pub fn par_forest(
+    colors: &ColorScheme,
     args: &Args,
     root: impl AsRef<Path>,
     leaves: impl IntoIterator<Item = Entry>,
@@ -479,7 +482,7 @@ pub fn par_forest(
 
     tracing::info!("Building forest in parallel with {num_threads} workers");
     if num_threads <= 1 {
-        return make_forest(args, root, leaves);
+        return make_forest(colors, args, root, leaves);
     }
 
     thread::scope(|ts| {
@@ -493,7 +496,7 @@ pub fn par_forest(
                     let args = args.clone();
                     let root = root.clone();
                     let rx = rx.clone();
-                    move || make_forest(&args, &root, rx.into_iter().flatten())
+                    move || make_forest(colors, &args, &root, rx.into_iter().flatten())
                 })
             })
             .map(Either::Left)

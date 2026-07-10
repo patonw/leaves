@@ -15,9 +15,9 @@ use ratatui::{
 };
 
 use crate::cli::Args;
+use crate::colors::ColorScheme;
 use crate::core::{Entry, Forest};
 use crate::forest::par_forest;
-use crate::util::file_color;
 
 #[derive(Default, Clone)]
 pub struct ScanState {
@@ -27,15 +27,16 @@ pub struct ScanState {
     pub total: usize,
 }
 
-pub fn walk_fs(args: &Args, state: Arc<Mutex<ScanState>>) -> Result<Forest> {
+pub fn walk_fs(colors: &ColorScheme, args: &Args, state: Arc<Mutex<ScanState>>) -> Result<Forest> {
     let root = args.path.canonicalize()?;
 
-    let rx = spawn_walker(args, state, root)?;
+    let rx = spawn_walker(colors, args, state, root)?;
 
-    Ok(par_forest(args, &args.path, rx, None))
+    Ok(par_forest(colors, args, &args.path, rx, None))
 }
 
 pub fn spawn_walker(
+    colors: &ColorScheme,
     args: &Args,
     state: Arc<Mutex<ScanState>>,
     root: impl AsRef<Path>,
@@ -55,11 +56,13 @@ pub fn spawn_walker(
         .same_file_system(!args.cross_fs)
         .build_parallel();
 
+    let colors = colors.clone();
     std::thread::spawn(move || {
         walker.run(move || {
             let tx = tx.clone();
             // TODO: lock-free scan state
             let state = state.clone();
+            let colors = colors.clone();
 
             Box::new(move |result| {
                 match result {
@@ -80,7 +83,7 @@ pub fn spawn_walker(
                             return WalkState::Continue;
                         }
 
-                        let color = file_color(ent.path());
+                        let color = colors.file_color(ent.path());
                         let entry = Entry {
                             path: ent.path().into(),
                             size: metadata.len() as usize,

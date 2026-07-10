@@ -25,7 +25,6 @@ use thousands::Separable;
 use tracing::{Level, instrument, span};
 use tui_tree_widget::{Scrollbar, Tree, TreeItem};
 
-use crate::core::{DbgEntry, DbgTrees, ENTRY_CHUNK_SIZE, Entry, EntryInfo, Forest, StackAddr};
 use crate::explorer::build_nav_tree;
 use crate::forest::{
     deforest, make_forest, merge_forests, par_forest, prune_entry, tree_find_path,
@@ -35,8 +34,11 @@ use crate::scanfs::spawn_walker;
 use crate::state::{
     AppAction, AppMode, AppState, TreeFocus, TreeFocusBuilder, get_selection, get_title,
 };
-use crate::util::ext_color;
 use crate::{cli::Args, config::Config};
+use crate::{
+    colors::ColorScheme,
+    core::{DbgEntry, DbgTrees, ENTRY_CHUNK_SIZE, Entry, EntryInfo, Forest, StackAddr},
+};
 
 struct MouseyTerm<'a>(&'a mut DefaultTerminal);
 
@@ -78,6 +80,7 @@ impl<'a> Drop for MouseyTerm<'a> {
 
 pub struct App {
     config: Config,
+    colors: ColorScheme,
     args: Args,
     exit: bool,
 
@@ -90,7 +93,7 @@ pub struct App {
 
 impl App {
     #[instrument(level = "debug", skip_all)]
-    pub fn new(config: Config, args: Args, entries: Forest) -> Self {
+    pub fn new(config: Config, colors: ColorScheme, args: Args, entries: Forest) -> Self {
         let tree_items = build_nav_tree(entries.as_slice());
         let focus = span!(Level::DEBUG, "Wrapping initial tree focus").in_scope(|| {
             TreeFocusBuilder {
@@ -102,6 +105,7 @@ impl App {
 
         Self {
             config,
+            colors,
             args,
             exit: false,
             entries: focus,
@@ -180,7 +184,14 @@ impl App {
 
         let layout = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints(vec![Constraint::Max(50), Constraint::Fill(10)])
+            .constraints(vec![
+                if area.width < 200 {
+                    Constraint::Percentage(25)
+                } else {
+                    Constraint::Max(50)
+                },
+                Constraint::Fill(10),
+            ])
             .split(area);
 
         let sidebar = Layout::default()
@@ -237,7 +248,7 @@ impl App {
             if !state.skip_view.is_empty()
                 && let Some(tag) = &state.tag
             {
-                let style = Style::from(ext_color(tag));
+                let style = Style::from(self.colors.ext_color(tag));
                 window = window.border_style(style);
             }
         }
@@ -680,6 +691,7 @@ impl App {
                 })?;
 
                 let tree = par_forest(
+                    &self.colors,
                     &self.args.with_depth(usize::MAX),
                     &state.root,
                     leaves,
@@ -785,7 +797,7 @@ impl App {
                 };
 
                 // Use rehash to summarize node & rebuild tree structure for summaries
-                let tree = make_forest(&args, &state.root, deforest(pruned));
+                let tree = make_forest(&self.colors, &args, &state.root, deforest(pruned));
                 // let (mut kidding, _) = rehash(&args, &root, deforest(pruned));
                 // let tree = treeify(&args, &mut kidding, &root, &tag);
                 let tree = merge_forests(forest, tree);
@@ -867,13 +879,13 @@ impl App {
             Either::Left(it) => tracing::debug!("Pruned entry {:?}", DbgEntry(&it)),
             Either::Right(subtree) => tracing::debug!("Pruned {} subtrees", subtree.len()),
         }
-        let rx = spawn_walker(&args, Default::default(), &target)?;
+        let rx = spawn_walker(&self.colors, &args, Default::default(), &target)?;
         let leaves = rx.into_iter().filter(|it| {
             it.path.starts_with(target.as_path())
                 && (tag.is_none()
                     || it.path.extension().unwrap_or_default() == tag.as_ref().unwrap())
         });
-        let tree = make_forest(&args, &state.root, leaves);
+        let tree = make_forest(&self.colors, &args, &state.root, leaves);
         tracing::debug!("Expanded subtree {:?}", DbgTrees(&tree));
         let tree = merge_forests(forest, tree);
         self.entries = TreeFocusBuilder {
@@ -901,9 +913,9 @@ impl App {
         // tracing::debug!(depth, "Expansion depth");
 
         // Don't need to prune since we're replacing the entire tree
-        let rx = spawn_walker(&self.args, Default::default(), &state.root)?;
+        let rx = spawn_walker(&self.colors, &self.args, Default::default(), &state.root)?;
 
-        let tree = par_forest(&self.args, &state.root, rx, nfiles);
+        let tree = par_forest(&self.colors, &self.args, &state.root, rx, nfiles);
 
         self.entries = TreeFocusBuilder {
             tree,
