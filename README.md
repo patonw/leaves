@@ -205,7 +205,54 @@ To return to normal mode, press the `x` key again.
 
 ![x-ray view](./docs/images/xray-mode.png)
 
-### Practical Considerations
+## Configuration
+
+Leaves reads from `$USER_CONFIG_DIR/leaves/setings.toml`. The exact location depends on your platform. For most Linux users this is under `~/.config/`. You can override most settings using environment variables prefixed by `LEAVES_`.
+
+| setting | value | description | environment |
+| --- | --- | --- | --- |
+| dark_mode | true/false | renders elements with lighter colors for enhanced visibility on dark terminals | LEAVES_DARK_MODE |
+| color_shift | 0.0 to 1.0 | Lightens or darkens colors for better visibility | LEAVES_COLOR_SHIFT |
+| colors | theme name | Name of a theme for file/directory gradients | LEAVES_COLORS |
+| dir_style | thick/plain | Renders directory borders with stronger lines | LEAVES_DIR_STYLE |
+
+
+### Themes
+
+There are four built in themes:
+
+- fall: warm colors for files & extensions, cool colors for directories
+- spring: cool colors for extensions and warm colors for directories
+- greys: shades of grey for everything
+- mono: black and white
+
+Additionally, you can create new themes in the configuration file using sections named `themes.YOUR_THEME`. Each section needs `dirs` and `files` which are arrays of HTML color codes. These can be named colors, hex RGB or rgb/hsl triples.
+
+```toml
+...
+colors = "custom"
+
+[themes.custom]
+dirs = [
+  "#4ac16d",
+  "#1fa187",
+  "#277f8e",
+  "#365c8d",
+  "#365c8d",
+  "#440154",
+  "hsl(120, 100%, 25%)",
+]
+files = [
+  "#f5db4c",
+  "#fcae12",
+  "#f78410",
+  "#e65d2f",
+  "#cb4149",
+]
+```
+
+
+## Practical Considerations
 
 While *leaves* prunes directories at a relatively shallow depth, you can override it to load every file into memory. Files too small to display with rectangles will be represented by dots. The interface can handle millions of files while being generally responsive. However, there will be some delay when switching modes.
 
