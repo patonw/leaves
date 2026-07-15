@@ -2,9 +2,11 @@
   pkgs,
   fenix,
   gitignore,
-  naersk,
-  rust-toolchain ? fenix.combine [
-    fenix.stable.toolchain
+  naersk-src,
+  target ? "x86_64-unknown-linux-musl",
+  rust-toolchain ? with fenix; combine [
+    stable.toolchain
+    targets.${target}.stable.rust-std
   ],
 }:
 let
@@ -13,12 +15,17 @@ let
     stdenv.cc.cc.lib
   ];
 
-  callPackage = pkgs.lib.callPackageWith {
-    inherit pkgs fenix rust-toolchain naersk gitignore;
-    inherit (gitignore) gitignoreSource;
+  toolchain = rust-toolchain;
+  naersk = pkgs.callPackage naersk-src {
+    cargo = toolchain;
+    rustc = toolchain;
   };
 in
 {
   inherit pkgs libraries rust-toolchain;
-}
 
+  leaves = naersk.buildPackage {
+    CARGO_BUILD_TARGET = target;
+    src = gitignore.gitignoreSource ./.;
+  };
+}

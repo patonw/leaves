@@ -2,8 +2,6 @@ name: Build project binaries
 
 on:
   push:
-    tags:
-    - "*"
 
 jobs:
   build:
@@ -19,13 +17,21 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: install cross targets
+        run: rustup target add x86_64-unknown-linux-musl
       - name: build
-        run: cargo build --release
+        run: cargo build --release --target=x86_64-unknown-linux-gnu --target=x86_64-unknown-linux-musl
+      - name: copy bins
+        run: |
+          mkdir artifacts
+          cp target/x86_64-unknown-linux-gnu/release/leaves artifacts/leaves-x86_64-linux-glibc
+          cp target/x86_64-unknown-linux-musl/release/leaves artifacts/leaves-x86_64-linux-musl
+
       - name: Upload binary artifact
         uses: actions/upload-artifact@v7
         with:
-          name: leaves-x86_64-linux
-          path: target/release/leaves
+          name: leaves-linux
+          path: artifacts
   release:
     if: github.ref_type == 'tag'
     needs:
@@ -37,9 +43,11 @@ jobs:
       - name: Download binary
         uses: actions/download-artifact@v8
         with:
-          name: leaves-x86_64-linux
+          name: leaves-linux
       - run: |
-          mv leaves leaves-${{  github.ref_name }}-x86_64-linux
+          ls -la
+          mv leaves-x86_64-linux-glibc leaves-${{  github.ref_name }}-x86_64-linux
+          mv leaves-x86_64-linux-musl leaves-${{  github.ref_name }}-x86_64-linux-musl
       - name: Create a draft release
         uses: softprops/action-gh-release@v3
         with:
@@ -48,4 +56,4 @@ jobs:
           generate_release_notes: true
           files: |
             leaves-${{  github.ref_name }}-x86_64-linux
-
+            leaves-${{  github.ref_name }}-x86_64-linux-musl

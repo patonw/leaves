@@ -26,7 +26,7 @@
         naersk = pkgs.callPackage naersk-src {};
         gitignore = pkgs.callPackage gitignore-src {};
         callPackage = pkgs.lib.callPackageWith {
-          inherit pkgs fenix naersk gitignore ;
+          inherit pkgs fenix naersk naersk-src gitignore;
           inherit (gitignore) gitignoreSource;
         };
       in
