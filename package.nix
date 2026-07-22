@@ -20,12 +20,29 @@ let
     cargo = toolchain;
     rustc = toolchain;
   };
-in
-{
-  inherit pkgs libraries rust-toolchain;
-
   leaves = naersk.buildPackage {
     CARGO_BUILD_TARGET = target;
     src = gitignore.gitignoreSource ./.;
+  };
+in
+{
+  inherit pkgs libraries rust-toolchain leaves;
+
+  default = leaves;
+
+  perfShell = pkgs.mkShell {
+    LD_LIBRARY_PATH = "${pkgs.lib.makeLibraryPath libraries}";
+    packages = with pkgs; [
+      niv
+      cargo-generate
+      mdbook
+      mdbook-d2
+      pkg-config
+      rust-toolchain
+      stgit
+      perf
+      cargo-flamegraph
+      rust-addr2line
+    ] ++ libraries;
   };
 }
