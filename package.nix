@@ -3,7 +3,7 @@
   fenix,
   gitignore,
   naersk-src,
-  target ? "x86_64-unknown-linux-musl",
+  target ? ( if pkgs.stdenv.isDarwin then (if builtins.match "aarch64" pkgs.stdenv.hostPlatform.system != null then "aarch64-apple-darwin" else "x86_64-apple-darwin") else "x86_64-unknown-linux-musl" ),
   rust-toolchain ? with fenix; combine [
     stable.toolchain
     targets.${target}.stable.rust-std
