@@ -19,6 +19,27 @@ However, due to the limited resolution of working at a character level, this is 
 You can download a pre-built binary for a select number of platforms from the releases page.
 If one is not available for your system, follow this section to build from source.
 
+### Run with Nix (no clone)
+
+If you have [Nix](https://nixos.org/download/) with flakes enabled, you can build and run
+the latest version directly from the repository without cloning:
+
+```bash
+$ nix run github:patonw/leaves
+```
+
+Pass arguments to *leaves* after a `--`:
+
+```bash
+$ nix run github:patonw/leaves -- -A -d 3 /var
+```
+
+To install it into your profile instead:
+
+```bash
+$ nix profile install github:patonw/leaves
+```
+
 ### Dependencies
 
 A Rust toolchain is required to build this project.
