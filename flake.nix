@@ -30,8 +30,22 @@
           inherit (gitignore) gitignoreSource;
         };
       in
+      let
+        workspace = callPackage ./package.nix {};
+      in
       {
-        packages = callPackage ./package.nix {};
+        packages = {
+          inherit (workspace) leaves default;
+        };
+        legacyPackages = workspace;
+        apps = rec {
+          leaves = flake-utils.lib.mkApp {
+            drv = workspace.leaves;
+            name = "leaves";
+          };
+          default = leaves;
+        };
+        devShells.default = import ./shell.nix { _workspace = workspace; };
       }
     );
 }

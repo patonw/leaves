@@ -6,4 +6,4 @@ let
     sha256 = lock.nodes.flake-compat.locked.narHash;
   };
 in
-(import flake-compat { src = ./.; }).defaultNix.outputs.packages.${builtins.currentSystem}
+(import flake-compat { src = ./.; }).defaultNix.outputs.legacyPackages.${builtins.currentSystem}
