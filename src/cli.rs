@@ -27,6 +27,15 @@ pub struct Args {
     #[arg(short, long)]
     pub xray: bool,
 
+    /// Report apparent (logical) file sizes instead of allocated disk usage.
+    ///
+    /// By default sizes reflect the space actually used by each file, like `du`:
+    /// `st_blocks` on Unix, the compressed size on Windows. This accounts for sparse
+    /// files, transparent compression and block rounding. Apparent size is the logical
+    /// length reported by `ls -l` or Explorer's "Size" (as opposed to "Size on disk").
+    #[arg(long)]
+    pub apparent_size: bool,
+
     /// Don't *automatically* skip any files. Only overrides will be used.
     #[arg(short = 'A', long)]
     pub include_all: bool,

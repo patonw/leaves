@@ -57,6 +57,7 @@ pub fn spawn_walker(
         .build_parallel();
 
     let colors = colors.clone();
+    let apparent_size = args.apparent_size;
     std::thread::spawn(move || {
         walker.run(move || {
             let tx = tx.clone();
@@ -76,17 +77,24 @@ pub fn spawn_walker(
                         let Ok(metadata) = ent.metadata() else {
                             return WalkState::Continue;
                         };
-                        if metadata.is_file() && metadata.len() > 0 {
-                            let mut state = state.lock().unwrap();
-                            state.total += metadata.len() as usize;
-                        } else {
+                        if !metadata.is_file() {
                             return WalkState::Continue;
                         }
+                        let size = if apparent_size {
+                            metadata.len()
+                        } else {
+                            filesize::file_real_size_fast(ent.path(), &metadata)
+                                .unwrap_or(metadata.len())
+                        } as usize;
+                        if size == 0 {
+                            return WalkState::Continue;
+                        }
+                        state.lock().unwrap().total += size;
 
                         let color = colors.file_color(ent.path());
                         let entry = Entry {
                             path: ent.path().into(),
-                            size: metadata.len() as usize,
+                            size,
                             nfiles: 1,
                             leaves: 1,
                             color,
