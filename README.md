@@ -112,8 +112,18 @@ Options:
           
           [default: 5]
 
+      --cross-fs
+          Allow crossing filesystem boundarires.
+          
+          Use this on platforms without support for querying filesystem id.
+
   -x, --xray
           Group files by type at the top-level, then split each region by directory
+
+      --apparent-size
+          Report apparent (logical) file sizes instead of allocated disk usage.
+          
+          By default sizes reflect the space actually used by each file, like `du`: `st_blocks` on Unix, the compressed size on Windows. This accounts for sparse files, transparent compression and block rounding. Apparent size is the logical length reported by `ls -l` or Explorer's "Size" (as opposed to "Size on disk").
 
   -A, --include-all
           Don't *automatically* skip any files. Only overrides will be used
@@ -264,6 +274,13 @@ update `~/.config/git/ignore` or use negative overrides:
 ```bash
 leaves -A -d 3 / '!/proc' '!/tmp' '!/run' '!/sys' '!/dev' '!/mnt' '!/nix'
 ```
+
+#### Sizes
+
+By default *leaves* reports space used on disk rather than logical length, via the
+[`filesize`](https://crates.io/crates/filesize) crate: `st_blocks` × 512 on Unix (the figure `du` uses) and
+`GetCompressedFileSize` on Windows. Sparse files and transparently compressed files (APFS, btrfs, ZFS, NTFS
+`compact`) are therefore counted by what they actually occupy. Pass `--apparent-size` to use logical sizes instead.
 
 #### Links
 
